@@ -33,12 +33,13 @@ void Utils::EnterNativeFullscreen(HWND window) {
     monitor.cbSize = sizeof(MONITORINFO);
     placement.length = sizeof(WINDOWPLACEMENT);
     ::GetWindowPlacement(window, &placement);
-    rect_before_fullscreen_ = RECT{
-        placement.rcNormalPosition.left,
-        placement.rcNormalPosition.top,
-        placement.rcNormalPosition.right,
-        placement.rcNormalPosition.bottom,
-    };
+    // rect_before_fullscreen_ = RECT{
+    //     placement.rcNormalPosition.left,
+    //     placement.rcNormalPosition.top,
+    //     placement.rcNormalPosition.right,
+    //     placement.rcNormalPosition.bottom,
+    // };
+    ::GetWindowRect(window, &rect_before_fullscreen_);
     ::GetMonitorInfo(::MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST),
                      &monitor);
     ::SetWindowLongPtr(window, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
