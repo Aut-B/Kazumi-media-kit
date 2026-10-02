@@ -250,23 +250,29 @@ public class VideoOutput: NSObject {
     }
   #endif
 
-    private var videoSize: CGSize {
-        // fixed size
-        if width != nil && height != nil {
-            return CGSize(
-                width: Double(width!),
-                height: Double(height!)
-            )
-        }
-        
-        let params = MPVHelpers.getVideoOutParams(handle)
-        return CGSize(
-            width: Double(width ?? (params.rotate == 0 || params.rotate == 180
-                                    ? params.dw
-                                    : params.dh)),
-            height: Double(height ?? (params.rotate == 0 || params.rotate == 180
-                                      ? params.dh
-                                      : params.dw))
-        )
+  private var videoSize: CGSize {
+    // fixed size
+    if width != nil && height != nil {
+      return CGSize(
+        width: Double(width!),
+        height: Double(height!)
+      )
+    }
+
+    let params = MPVHelpers.getVideoOutParams(handle)
+    return CGSize(
+      width: Double(
+        width
+          ?? (params.rotate == 0 || params.rotate == 180
+            ? params.dw
+            : params.dh)
+      ),
+      height: Double(
+        height
+          ?? (params.rotate == 0 || params.rotate == 180
+            ? params.dh
+            : params.dw)
+      )
+    )
   }
 }

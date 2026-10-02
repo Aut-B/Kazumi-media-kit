@@ -118,17 +118,29 @@ public class PictureInPicture: NSObject {
     }
   }
 
+  /// 释放资源。
+  ///
+  /// 可能在任意线程（`VideoOutput.deinit`）被调用，而 AVKit / UIKit 的对象只能
+  /// 在主线程序列上访问，因此统一转投主线程执行。
   public func dispose() {
     isRunning = false
-    if #available(iOS 15.0, *) {
-      if pipController?.isPictureInPictureActive ?? false {
-        pipController?.stopPictureInPicture()
+
+    let layer = displayLayer
+    guard #available(iOS 15.0, *) else {
+      DispatchQueue.main.async {
+        layer.removeFromSuperlayer()
       }
-      pipController?.delegate = nil
-      pipController = nil
+      return
     }
-    DispatchQueue.main.async { [weak self] in
-      self?.displayLayer.removeFromSuperlayer()
+
+    let controller = pipController
+    pipController = nil
+    DispatchQueue.main.async {
+      if controller?.isPictureInPictureActive ?? false {
+        controller?.stopPictureInPicture()
+      }
+      controller?.delegate = nil
+      layer.removeFromSuperlayer()
     }
   }
 
