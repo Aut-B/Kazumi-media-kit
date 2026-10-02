@@ -17,6 +17,7 @@ import 'package:media_kit/src/player/native/core/native_library.dart';
 
 import 'package:media_kit/generated/libmpv/bindings.dart';
 
+import 'package:media_kit_video/src/picture_in_picture.dart';
 import 'package:media_kit_video/src/video_controller/video_controller.dart';
 import 'package:media_kit_video/src/video_controller/platform_video_controller.dart';
 
@@ -139,6 +140,41 @@ class NativeVideoController extends PlatformVideoController {
     });
   }
 
+  /// 当前平台 / 设备是否支持系统级画中画（仅 iOS）。
+  @override
+  Future<bool> isPictureInPictureSupported() async {
+    if (!Platform.isIOS) {
+      return false;
+    }
+    try {
+      return await _channel.invokeMethod<bool>(
+            'VideoOutput.IsPictureInPictureSupported',
+          ) ??
+          false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 进入 / 退出系统级画中画（仅 iOS）。
+  ///
+  /// 播放 / 暂停 / 快进在原生侧直接操作 libmpv，media_kit 会通过属性观察自动
+  /// 同步 Dart 状态；进入 / 退出结果通过 `PictureInPicture.events` 通知。
+  @override
+  Future<void> setPictureInPicture(bool value) async {
+    if (!Platform.isIOS) {
+      return;
+    }
+    try {
+      await _channel.invokeMethod('VideoOutput.SetPictureInPicture', {
+        'handle': player.handle.toString(),
+        'value': value,
+      });
+    } catch (exception) {
+      debugPrint('NativeVideoController: setPictureInPicture: $exception');
+    }
+  }
+
   /// Disposes the instance. Releases allocated resources back to the system.
   Future<void> _dispose() {
     final handle = player.handle;
@@ -183,6 +219,17 @@ class NativeVideoController extends PlatformVideoController {
                       completer?.complete();
                     }
                   }
+                  break;
+                }
+              case 'VideoOutput.PictureInPictureStateChanged':
+                {
+                  final bool active = (args['active'] as bool?) ?? false;
+                  PictureInPicture.emit(active ? 'start' : 'stop');
+                  break;
+                }
+              case 'VideoOutput.PictureInPictureRestoreUI':
+                {
+                  PictureInPicture.emit('restore');
                   break;
                 }
               default:

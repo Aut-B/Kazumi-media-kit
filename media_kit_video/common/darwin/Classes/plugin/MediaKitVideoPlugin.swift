@@ -57,6 +57,10 @@ public class MediaKitVideoPlugin: NSObject, FlutterPlugin {
       handleSetSizeMethodCall(call.arguments, result)
     case "VideoOutputManager.Dispose":
       handleDisposeMethodCall(call.arguments, result)
+    case "VideoOutput.SetPictureInPicture":
+      handleSetPictureInPictureMethodCall(call.arguments, result)
+    case "VideoOutput.IsPictureInPictureSupported":
+      result(VideoOutput.isPictureInPictureSupported)
     case "Utils.EnterNativeFullscreen":
       handleEnterNativeFullscreenMethodCall(call.arguments, result)
     case "Utils.ExitNativeFullscreen":
@@ -95,6 +99,13 @@ public class MediaKitVideoPlugin: NSObject, FlutterPlugin {
             ],
           ] as [String: Any]
         )
+      },
+      pipEventCallback: { (method: String, args: [String: Any]) in
+        DispatchQueue.main.async {
+          var payload: [String: Any] = ["handle": handle!]
+          payload.merge(args) { _, new in new }
+          self.channel.invokeMethod(method, arguments: payload)
+        }
       }
     )
 
@@ -139,6 +150,29 @@ public class MediaKitVideoPlugin: NSObject, FlutterPlugin {
       handle: handle!
     )
 
+    result(nil)
+  }
+
+  private func handleSetPictureInPictureMethodCall(
+    _ arguments: Any?,
+    _ result: FlutterResult
+  ) {
+    let args = arguments as? [String: Any]
+    guard let handleStr = args?["handle"] as? String,
+      let handle = Int64(handleStr)
+    else {
+      result(
+        FlutterError(
+          code: "invalid_args",
+          message: "handle must be an Int64",
+          details: nil
+        )
+      )
+      return
+    }
+
+    let value = (args?["value"] as? Bool) ?? false
+    videoOutputManager.setPictureInPicture(handle: handle, value: value)
     result(nil)
   }
 

@@ -15,16 +15,26 @@ public class VideoOutputManager: NSObject {
   public func create(
     handle: Int64,
     configuration: VideoOutputConfiguration,
-    textureUpdateCallback: @escaping VideoOutput.TextureUpdateCallback
+    textureUpdateCallback: @escaping VideoOutput.TextureUpdateCallback,
+    pipEventCallback: @escaping VideoOutput.PictureInPictureEventCallback
   ) {
     let videoOutput = VideoOutput(
       handle: handle,
       configuration: configuration,
       registry: self.registry,
-      textureUpdateCallback: textureUpdateCallback
+      textureUpdateCallback: textureUpdateCallback,
+      pipEventCallback: pipEventCallback
     )
 
     self.videoOutputs[handle] = videoOutput
+  }
+
+  /// 进入 / 退出系统级画中画。
+  public func setPictureInPicture(
+    handle: Int64,
+    value: Bool
+  ) {
+    self.videoOutputs[handle]?.setPictureInPicture(value)
   }
 
   public func setSize(

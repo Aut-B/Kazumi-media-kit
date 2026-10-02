@@ -46,6 +46,17 @@ abstract class PlatformVideoController {
   /// * “With great power comes great responsibility”
   Future<void>? setSize({int? width, int? height});
 
+  /// 当前平台 / 设备是否支持系统级画中画。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台恒为 `false`。
+  Future<bool> isPictureInPictureSupported() => Future.value(false);
+
+  /// 进入 / 退出系统级画中画。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台为空实现。
+  /// 进入 / 退出结果可通过 `PictureInPicture.events` 监听。
+  Future<void> setPictureInPicture(bool value) => Future.value();
+
   /// A [Future] that completes when the first video frame has been rendered.
   Future<void> get waitUntilFirstFrameRendered =>
       waitUntilFirstFrameRenderedCompleter.future;
