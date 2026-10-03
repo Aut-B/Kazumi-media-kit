@@ -17,8 +17,7 @@ import UIKit
 /// （可悬浮在其它 App 之上，切后台 / 锁屏继续播放）。
 ///
 /// 播放控制（播放 / 暂停 / 快进）直接读写 libmpv 的 `pause`、`time-pos`
-/// 属性。media_kit 的 Dart 层 observe 了这些属性
-/// （见 `media_kit/lib/src/media_kit_player.dart` 中的 `pause` / `time-pos`），
+/// 属性（经 `MPVHelpers`）。media_kit 的 Dart 层 observe 了这些属性，
 /// 因此状态会自动同步回上层 UI，无需额外的 Dart 往返。
 ///
 /// 两种进入方式：
@@ -27,13 +26,13 @@ import UIKit
 ///   打开 `canStartPictureInPictureAutomaticallyFromInline`，**不**立即弹出窗口，
 ///   由系统在用户划回主屏幕（App 进入后台）时自动进入画中画。
 public class PictureInPicture: NSObject {
-  /// 事件回调：`(方法名, 参数)`，由 [VideoOutput] 转发给 Dart 侧。
+  /// 事件回调：`(方法名, 参数)`，由 `VideoOutput` 转发给 Dart 侧。
   public typealias EventCallback = (String, [String: Any]) -> Void
 
   private let handle: OpaquePointer
   private let eventCallback: EventCallback
 
-  /// 承载画面的图层（iOS 8+ 可用）。
+  /// 承载画面的图层。
   private let displayLayer = AVSampleBufferDisplayLayer()
 
   /// 承载 [displayLayer] 的宿主视图。
@@ -42,9 +41,6 @@ public class PictureInPicture: NSObject {
   /// 塞在 Flutter 视图之下（完全被遮挡），系统可能认为「画面不可见」而拒绝启动
   /// 画中画。因此这里用一个 2×2 点的宿主视图挂在 Flutter 视图**之上**：
   /// 尺寸极小（约几个像素）因而观感上无影响，同时满足可见性判定。
-  ///
-  /// 位置取「屏幕左边缘、纵向落在视频画面内」——既避开了圆角与刘海被裁掉的
-  /// 区域，又因叠在视频之上而与画面融为一体。
   private lazy var hostView: UIView = {
     let view = UIView(frame: .zero)
     view.isUserInteractionEnabled = false
@@ -59,8 +55,7 @@ public class PictureInPicture: NSObject {
   ///
   /// 小窗里的进度条与「前进 / 后退 N 秒」按钮都以画面图层的时间轴为准。若不设置它，
   /// 系统无从判断当前播放到哪儿，会把进度条画成一条满格长条，并因为「已经到片尾」
-  /// 而把前进按钮置灰。这里挂一个以主机时钟为时间源的 timebase，逐帧按 libmpv
-  /// 的 `time-pos` 校准。
+  /// 而把前进按钮置灰。
   private var controlTimebase: CMTimebase?
 
   /// 是否处于「已武装」状态：为 true 时向 [displayLayer] 提供画面帧。
@@ -77,73 +72,12 @@ public class PictureInPicture: NSObject {
   /// 上一次在「小窗未显示」状态下喂帧的时间，用于降频。
   private var lastIdleEnqueue: CFTimeInterval = 0
 
-  // MARK: - 启动重试阶梯
-  //
-  // 系统只在 `isPictureInPicturePossible` 为真时才理会 `startPictureInPicture()`；
-  // 为假时 iOS 15 会**静默忽略**这次调用（不进 delegate、不报错），表现即「点了没
-  // 反应、小窗不弹」。而该判定依赖「画面源位于可见视图层级中」与「图层里确实有
-  // 画面」，在旧机型 / 慢机型上这两件事未必在点按那一瞬间就已成立。于是这里不
-  // 再一次性调用，而是保留一个短暂时限，期间反复确认、顺手把画面源扶正。
-
-  /// 启动尝试的截止时刻；`0` 表示当前没有正在进行的尝试。
-  private var startDeadline: CFTimeInterval = 0
-
-  /// 已进行的启动尝试次数（用于诊断，也用于决定是否放大宿主视图）。
-  private var startTries = 0
-
-  /// 宿主视图当前边长（点）。默认 2 点，近乎不可见。
-  private var hostSide: CGFloat = 2
-
-  /// 上一次成功进入画中画时用的宿主视图边长，作为后续启动的起点。
-  private var lastGoodHostSide: CGFloat = 2
-
   /// 向宿主请求一帧最新画面。
   ///
   /// 由 `VideoOutput` 注入：补帧要经过渲染线程取像素缓冲，不能在这里直接做。
-  /// 参数为 `true` 时表示「强势补帧」——启动阶段需要它，因为系统判定画中画是否
-  /// 可用，前提就是图层里确实有画面，这一帧不能省。小窗显示期间的保活通道用
-  /// `false`，走与正常喂帧相同的温和路径（不就绪就丢弃，交给卡死自愈处理）。
-  public var onNeedFrame: ((Bool) -> Void)?
-
-  // MARK: - 诊断计数
-  //
-  // 「小窗黑屏」可能断在好几处：渲染回调根本没出帧、图层拒绝接收样本、样本已经
-  // 入队但系统没把画面接进小窗……单看现象无法区分。这几个计数与 [diagnostics] 用来
-  // 把断点定位到具体一环，平时不参与播放逻辑。
-
-  /// [enqueue] 被调用的次数，即渲染回调实际出帧数。
-  private var statAttempt = 0
-  /// 真正交给图层的样本数。
-  private var statEnqueued = 0
-  /// 因图层 `isReadyForMoreMediaData == false` 被丢弃的次数。
-  private var statNotReady = 0
-  /// 因尚未「武装」被丢弃的次数。
-  private var statNotArmed = 0
-  /// 因小窗未显示而降频丢弃的次数。
-  private var statThrottled = 0
-  /// 最近一次「图层不就绪」的起始时刻。
-  private var notReadySince: CFTimeInterval = 0
-  /// 最近一次因「图层长时间不就绪」触发 flush 的时刻。
-  private var lastStuckFlush: CFTimeInterval = 0
-
-  // MARK: - 小窗保活
-
-  /// 小窗显示期间主动补帧的定时器。
-  ///
-  /// 正常路径由媒体渲染回调驱动喂帧（每一帧渲染完成即送入图层）。但在个别运行环境
-  /// 里——例如 App 被另一个进程以「场景托管」的方式嵌入到它的窗口里——Flutter 的
-  /// 帧回调可能长时间不来，图层就再无新内容，小窗只剩黑屏。小窗显示期间补一条
-  /// 15 fps 的低速通道，与渲染回调共用 [onNeedFrame]，不改变正常路径的行为。
-  private var keepAliveTimer: Timer?
-
-  /// 小窗开始显示的时刻；`0` 表示当前未显示。
-  private var showingSince: CFTimeInterval = 0
-
-  /// [noteCopyNil] 记录：渲染回调在跑、却取不到像素缓冲的次数。
-  private var statCopyNil = 0
-
-  /// 保活定时器实际触发次数。
-  private var statTimerTicks = 0
+  /// 启动阶段主动补一帧，是为了保证图层里「有内容」——这正是系统判定画中画
+  /// 可用性的前提之一。
+  public var onNeedFrame: (() -> Void)?
 
   init(handle: OpaquePointer, eventCallback: @escaping EventCallback) {
     self.handle = handle
@@ -181,10 +115,8 @@ public class PictureInPicture: NSObject {
   /// 立即进入系统画中画（用户点按播放器上的「画中画」按钮）。
   ///
   /// 系统在 `isPictureInPicturePossible` 为 `false` 时会静默忽略
-  /// `startPictureInPicture()`，因此这里不赌「点按那一刻条件已经成立」，而是走一条
-  /// 最短 3 秒的重试阶梯（见 [_attemptStart]）：期间反复确认可用性、把画面源扶正、
-  /// 补一帧最新画面。阶梯走完仍不可用，就把具体读数报出来，而不是留下一个
-  /// 「点了没反应」的黑盒。
+  /// `startPictureInPicture()`，因此这里不赌「点按那一刻条件已经成立」：先把画面源
+  /// 扶正、补一帧，稍后再确认一次并启动。
   public func start() {
     guard #available(iOS 15.0, *) else {
       NSLog("PictureInPicture: requires iOS 15.0 or above")
@@ -198,70 +130,41 @@ public class PictureInPicture: NSObject {
     }
 
     isArmed = true
-    resetDiagnostics()
-    hostSide = lastGoodHostSide
-    startTries = 0
-    startDeadline = CACurrentMediaTime() + 3.0
-    DispatchQueue.main.async { [weak self] in
-      guard let self = self else { return }
-      self._attemptStart()
-    }
-  }
-
-  /// 单次启动尝试；条件不成立则在阶梯时限内续期重试。必须在主线程调用。
-  @available(iOS 15.0, *)
-  private func _attemptStart() {
-    // 已被 [stop] / [disarm] 取消。
-    guard startDeadline > 0 else {
-      return
-    }
-    guard let controller = _ensureController() else {
-      return
-    }
-    if controller.isPictureInPictureActive {
-      startDeadline = 0
-      return
-    }
-
-    if controller.isPictureInPicturePossible {
-      startDeadline = 0
-      controller.startPictureInPicture()
-      return
-    }
-
-    startTries += 1
-
-    // 系统还不认这个画面源：重新挂一次（保证它确实在最前、且被判定为可见），
-    // 图层状态异常时清掉，并补一帧最新画面。
-    attachDisplayLayer()
-    if displayLayer.status == .failed {
-      displayLayer.flush()
-    }
-    onNeedFrame?(true)
-
-    // 宿主视图平时只有 2 点见方；个别系统版本对画面源的尺寸判定更严，迟迟不就绪
-    // 时放大一档（对已经就绪的设备没有任何影响）。
-    if startTries >= 2, hostSide < 64 {
-      hostSide = hostSide < 24 ? 24 : 64
-      attachDisplayLayer()
-    }
-
-    if CACurrentMediaTime() < startDeadline {
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-        guard let self = self else { return }
-        self._attemptStart()
+    DispatchQueue.main.async { [weak self] () -> Void in
+      guard let instance = self else {
+        return
       }
-      return
+      guard let controller = instance.makeController() else {
+        return
+      }
+      if controller.isPictureInPictureActive {
+        return
+      }
+      if controller.isPictureInPicturePossible {
+        controller.startPictureInPicture()
+        return
+      }
+      // 系统还不认这个画面源：重新挂一次（保证它确实在最前、且被判定为可见），
+      // 图层状态异常时清掉，并补一帧最新画面，稍后再试一次。
+      instance.attachDisplayLayer()
+      if instance.displayLayer.status == .failed {
+        instance.displayLayer.flush()
+      }
+      instance.onNeedFrame?()
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+        [weak self] () -> Void in
+        guard let retry = self else {
+          return
+        }
+        guard let controller2 = retry.pipController,
+          controller2.isPictureInPicturePossible,
+          !controller2.isPictureInPictureActive
+        else {
+          return
+        }
+        controller2.startPictureInPicture()
+      }
     }
-
-    // 阶梯走到尽头：把判断依据一并报出来，免得又只能靠猜。
-    emitError(
-      "画中画启动失败：画面源未就绪（出帧 \(statAttempt)、入队 \(statEnqueued) 帧、"
-        + "图层 \(layerStatusText())、就绪 \(displayLayer.isReadyForMoreMediaData)、"
-        + "已挂入层级 \(hostView.window != nil)、App \(appStateText())）"
-    )
-    hostSide = lastGoodHostSide
-    attachDisplayLayer()
   }
 
   /// 「武装」自动画中画：不立即弹出窗口，而是在用户划回主屏幕（App 进入后台）时
@@ -277,34 +180,27 @@ public class PictureInPicture: NSObject {
       return
     }
     isArmed = true
-    hostSide = lastGoodHostSide
-    DispatchQueue.main.async { [weak self] in
-      guard let self = self else { return }
-      guard let controller = self._ensureController() else {
+    DispatchQueue.main.async { [weak self] () -> Void in
+      guard let instance = self else {
+        return
+      }
+      guard let controller = instance.makeController() else {
         return
       }
       controller.canStartPictureInPictureAutomaticallyFromInline = autoEnter
       // 自动进入（划回主屏幕）走的是系统的判定，同样要求图层里「有内容」；
       // 这里先补一帧，免得用户划出去时系统还在等第一帧。
-      self.onNeedFrame?(true)
+      instance.onNeedFrame?()
     }
   }
 
   /// 关闭画中画小窗，但**保持画面源可用**。
-  ///
-  /// 用户可以随时再次点按「画中画」按钮，或划回主屏幕让系统自动进入；若此处
-  /// 一并解除武装，下一次进入的小窗就会是黑屏。
   public func stop() {
     guard #available(iOS 15.0, *) else {
       return
     }
-    // 用户已经收起小窗，正在进行的启动重试必须一并作罢，否则它会随后把
-    // 小窗重新弹出来。
-    startDeadline = 0
-    DispatchQueue.main.async { [weak self] in
-      guard let self = self else { return }
-      self.stopKeepAlive()
-      self.pipController?.stopPictureInPicture()
+    DispatchQueue.main.async { [weak self] () -> Void in
+      self?.pipController?.stopPictureInPicture()
     }
   }
 
@@ -314,26 +210,20 @@ public class PictureInPicture: NSObject {
     isShowing = false
     lastPosition = -1
     lastIdleEnqueue = 0
-    startDeadline = 0
-    showingSince = 0
-    DispatchQueue.main.async { [weak self] in
-      self?.stopKeepAlive()
-    }
   }
 
   /// 为「换了视频源」做准备（连播下一集、切换清晰度、换源等）。
   ///
   /// 新视频的播放位置从 0 开始，而图层时间轴此前已推进到上一集的位置；时间轴
   /// 倒退会让 `AVSampleBufferDisplayLayer` 停止消化后续样本，表现即「App 里画面
-  /// 正常、小窗一直黑」。这里清空图层与时间轴，并丢掉上一集的弹幕，
-  /// 控制器本身保持不动，因此小窗会在下一帧到来后无缝接上新视频。
+  /// 正常、小窗一直黑」。这里清空图层与时间轴，控制器本身保持不动。
   public func prepareForNewMedia() {
     lastPosition = -1
     lastIdleEnqueue = 0
 
     let layer = displayLayer
     let timebase = controlTimebase
-    DispatchQueue.main.async {
+    DispatchQueue.main.async { () -> Void in
       layer.flush()
       if #available(iOS 15.0, *), let timebase = timebase {
         CMTimebaseSetTime(timebase, time: .zero)
@@ -350,17 +240,9 @@ public class PictureInPicture: NSObject {
 
     let layer = displayLayer
     let host = hostView
-    guard #available(iOS 15.0, *) else {
-      DispatchQueue.main.async {
-        layer.removeFromSuperlayer()
-        host.removeFromSuperview()
-      }
-      return
-    }
-
     let controller = pipController
     pipController = nil
-    DispatchQueue.main.async {
+    DispatchQueue.main.async { () -> Void in
       if controller?.isPictureInPictureActive ?? false {
         controller?.stopPictureInPicture()
       }
@@ -372,7 +254,7 @@ public class PictureInPicture: NSObject {
 
   /// 建立（或复用）画中画控制器。必须在主线程调用。
   @available(iOS 15.0, *)
-  private func _ensureController() -> AVPictureInPictureController? {
+  private func makeController() -> AVPictureInPictureController? {
     // 画中画需要「播放」类音频会话；这里补齐，避免被系统中断。
     activateAudioSession()
 
@@ -405,39 +287,16 @@ public class PictureInPicture: NSObject {
     guard #available(iOS 15.0, *) else {
       return
     }
-    statAttempt += 1
 
     guard isArmed else {
-      statNotArmed += 1
       return
     }
 
     // 图层尚未消化完上一帧时直接丢弃，避免堆积与卡顿。
     let layer = displayLayer
-    if !layer.isReadyForMoreMediaData {
-      statNotReady += 1
-      if !force {
-        // 小窗已经显示、图层却长时间不肯接收样本：多半是早先那批样本卡在队列里
-        // （时间轴倒退、或渲染在后台被挂起），此时队列永远不会自己腾空。主动清一次，
-        // 把管道重新打通，否则小窗会一直停在黑屏。
-        let now = CACurrentMediaTime()
-        if isShowing {
-          if notReadySince == 0 {
-            notReadySince = now
-          } else if now - notReadySince > 1.0, now - lastStuckFlush > 2.0 {
-            lastStuckFlush = now
-            notReadySince = 0
-            NSLog("PictureInPicture: layer stuck, flushing")
-            DispatchQueue.main.async {
-              layer.flush()
-            }
-          }
-        }
-        return
-      }
-      // force：下面在主线程先清队列、再入队，保证这一帧一定进得去。
+    if !layer.isReadyForMoreMediaData, !force {
+      return
     }
-    notReadySince = 0
 
     if !isShowing, !force {
       // 小窗还没显示：仍要维持图层里有画面——系统正是据此判断「有内容可以画中画」，
@@ -445,25 +304,22 @@ public class PictureInPicture: NSObject {
       // 那几个轮转使用的像素缓冲。
       let now = CACurrentMediaTime()
       if now - lastIdleEnqueue < 0.1 {
-        statThrottled += 1
         return
       }
       lastIdleEnqueue = now
     }
 
-    // 当前播放位置：既用于校准小窗进度条，也用于确定这一帧该显示哪些弹幕。
+    // 当前播放位置：用于校准小窗进度条与时间戳。
     let position = mpvPosition()
     if lastPosition >= 0, position < lastPosition - 1 {
       // 播放位置大幅倒退说明换了视频源；时间轴倒退会让图层停止消化后续样本。
-      DispatchQueue.main.async {
+      DispatchQueue.main.async { () -> Void in
         layer.flush()
       }
     }
     lastPosition = position
     syncTimebase(position)
 
-    // 有弹幕落在画面上时，先绘进帧的副本；否则直接使用原始帧（零额外开销）。
-    // 只有小窗真的显示出来了才绘制——仅仅「武装」了自动画中画时不应白白耗电。
     let frame = pixelBuffer
 
     var formatDescription: CMVideoFormatDescription?
@@ -517,8 +373,7 @@ public class PictureInPicture: NSObject {
       )
     }
 
-    statEnqueued += 1
-    DispatchQueue.main.async {
+    DispatchQueue.main.async { () -> Void in
       if layer.status == .failed || (force && !layer.isReadyForMoreMediaData) {
         layer.flush()
       }
@@ -538,88 +393,18 @@ public class PictureInPicture: NSObject {
 
   public func clearDanmaku() {}
 
-  // MARK: - 诊断
+  /// 记录一次「渲染回调在跑，但取不到像素缓冲」。
+  public func noteCopyNil() {}
 
-  /// 重置诊断计数（每次真正发起 / 进入画中画时调用）。
-  private func resetDiagnostics() {
-    statAttempt = 0
-    statEnqueued = 0
-    statNotReady = 0
-    statNotArmed = 0
-    statThrottled = 0
-    statCopyNil = 0
-    statTimerTicks = 0
-    notReadySince = 0
-    lastStuckFlush = 0
-  }
-
-  /// 图层当前状态的文字描述（用于日志与诊断）。
-  private func layerStatusText() -> String {
-    switch displayLayer.status {
-    case .failed:
-      return "failed"
-    case .rendering:
-      return "rendering"
-    default:
-      return "unknown"
-    }
-  }
-
-  /// App 当前运行状态的文字描述（用于诊断）。**必须在主线程调用**。
-  private func appStateText() -> String {
-    switch UIApplication.shared.applicationState {
-    case .active:
-      return "active"
-    case .inactive:
-      return "inactive"
-    case .background:
-      return "background"
-    default:
-      return "unknown"
-    }
-  }
-
-  /// 诊断快照：用于判断「小窗黑屏」断在哪一环。**必须在主线程调用**
-  /// （内部会读取 `AVPictureInPictureController` 与图层的状态）。
+  /// 诊断快照（精简版只返回基础状态）。
   public func diagnostics() -> [String: Any] {
-    let layer = displayLayer
-    var rate: Double = -1
-    if #available(iOS 15.0, *), let timebase = controlTimebase {
-      rate = CMTimebaseGetRate(timebase)
-    }
-    // 画面源在窗口里的落点与窗口自身尺寸：用于排查「贴边被裁掉、系统不认可见性」。
-    var hostOrigin = "nil"
-    var windowBounds = "nil"
-    if let window = hostView.window {
-      hostOrigin = "\(Int(hostView.frame.minX)),\(Int(hostView.frame.minY))"
-      windowBounds = "\(Int(window.bounds.width))x\(Int(window.bounds.height))"
-    }
     return [
       "supported": PictureInPicture.isSupported,
       "armed": isArmed,
       "showing": isShowing,
       "possible": isPossible,
-      "attempt": statAttempt,
-      "enqueued": statEnqueued,
-      "notReady": statNotReady,
-      "notArmed": statNotArmed,
-      "throttled": statThrottled,
-      "copyNil": statCopyNil,
-      "timerTicks": statTimerTicks,
-      "sinceShow": showingSince > 0 ? CACurrentMediaTime() - showingSince : -1,
-      "startTries": startTries,
-      "hostSide": Double(hostSide),
-      // 画面源是否真的挂进了窗口（false = 被移除或窗口还没就绪）。
-      "hostAttached": hostView.window != nil,
-      "hostOrigin": hostOrigin,
-      "windowBounds": windowBounds,
-      "appState": appStateText(),
-      "layerStatus": layerStatusText(),
-      "layerReady": layer.isReadyForMoreMediaData,
-      "layerHidden": layer.isHidden,
       "paused": mpvFlag("pause"),
       "position": mpvPosition(),
-      "timebaseRate": rate,
     ]
   }
 
@@ -628,8 +413,7 @@ public class PictureInPicture: NSObject {
   /// 激活播放类音频会话。
   ///
   /// 画中画要求 App 持有活跃的播放类音频会话；会话被抢占、或类别被改动过时，
-  /// 系统可能只给出一个没有画面的小窗。除创建控制器时之外，小窗真正开始显示时
-  /// 再补一次——那正是系统开始接管渲染的时刻。
+  /// 系统可能只给出一个没有画面的小窗。
   private func activateAudioSession() {
     do {
       let session = AVAudioSession.sharedInstance()
@@ -638,36 +422,6 @@ public class PictureInPicture: NSObject {
     } catch {
       NSLog("PictureInPicture: AVAudioSession error: \(error)")
     }
-  }
-
-  /// 小窗显示期间启动一条低速补帧通道（15 fps）。必须在主线程调用。
-  ///
-  /// 正常路径由媒体渲染回调驱动；这条通道只是兜底：万一渲染回调长时间不来，
-  /// 图层仍能持续拿到画面，小窗不至于停在黑屏。重复调用不会叠加定时器。
-  private func startKeepAlive() {
-    stopKeepAlive()
-    let timer = Timer(timeInterval: 1.0 / 15.0, repeats: true) { [weak self] _ in
-      guard let self = self, self.isArmed else {
-        self?.stopKeepAlive()
-        return
-      }
-      self.statTimerTicks += 1
-      self.onNeedFrame?(false)
-    }
-    // 用 .common 模式：界面滚动或有其它追踪行为时定时器也不会停摆。
-    RunLoop.main.add(timer, forMode: .common)
-    keepAliveTimer = timer
-  }
-
-  /// 停止低速补帧通道。
-  private func stopKeepAlive() {
-    keepAliveTimer?.invalidate()
-    keepAliveTimer = nil
-  }
-
-  /// 记录一次「渲染回调在跑，但取不到像素缓冲」（由 `VideoOutput` 在补帧时调用）。
-  public func noteCopyNil() {
-    statCopyNil += 1
   }
 
   /// 建立画面图层的时间轴（只做一次）。
@@ -721,18 +475,16 @@ public class PictureInPicture: NSObject {
   /// 之所以不直接挂在 window 图层最底层：那样会被 Flutter 视图完全遮挡，部分系统
   /// 版本会因此判定画面「不可见」，导致 `isPictureInPicturePossible` 恒为 false，
   /// 画中画按钮点了没有反应。
+  ///
+  /// 位置取窗口正中：无论窗口铺满屏幕、还是被宿主进程以「场景托管」的方式嵌在它
+  /// 自己的窗口里（此时可见区域与全屏并不一致），画面源都必定落在可见范围之内。
   private func attachDisplayLayer() {
     guard let window = PictureInPicture.keyWindow else {
       NSLog("PictureInPicture: key window not found")
       return
     }
 
-    // 只在极小的可见区域内显示（约几个像素），因此不会影响应用内观感。
-    // 位置取窗口正中：这样无论窗口是铺满屏幕、还是被宿主进程以「场景托管」的方式
-    // 嵌在它自己的窗口里（此时可见区域与全屏并不一致），画面源都必定落在可见范围
-    // 之内，不会因为贴边而落到被裁掉的区域上。
-    // 尺寸取 [hostSide]：默认 2 点，仅当启动阶梯发现「迟迟不就绪」时才放大。
-    let side = hostSide
+    let side: CGFloat = 2
     if hostView.superview !== window {
       hostView.removeFromSuperview()
       window.addSubview(hostView)
@@ -830,10 +582,6 @@ extension PictureInPicture: AVPictureInPictureControllerDelegate {
     // 处于「提供画面」状态，否则小窗会定格在最后一帧、甚至全黑。
     isArmed = true
     isShowing = true
-    startDeadline = 0
-    lastGoodHostSide = hostSide
-    resetDiagnostics()
-    showingSince = CACurrentMediaTime()
     attachDisplayLayer()
     // 启动阶段为了「让系统判定画面源可用」补过几帧，那批样本的时间戳与队列状态
     // 未必干净；小窗真正开始接管画面时清一次队列，让随后送进来的帧从头播放。
@@ -842,10 +590,7 @@ extension PictureInPicture: AVPictureInPictureControllerDelegate {
     }
     lastPosition = -1
     lastIdleEnqueue = 0
-    // 系统正是从这一刻开始接管画面。两件事必须补齐：音频会话要活跃（否则小窗
-    // 可能只有框没有画面），以及一条兜底的补帧通道（万一渲染回调不来）。
     activateAudioSession()
-    startKeepAlive()
     eventCallback("VideoOutput.PictureInPictureStateChanged", ["active": true])
   }
 
@@ -853,8 +598,6 @@ extension PictureInPicture: AVPictureInPictureControllerDelegate {
     _ pictureInPictureController: AVPictureInPictureController
   ) {
     isShowing = false
-    showingSince = 0
-    stopKeepAlive()
     eventCallback("VideoOutput.PictureInPictureStateChanged", ["active": false])
   }
 
@@ -862,7 +605,6 @@ extension PictureInPicture: AVPictureInPictureControllerDelegate {
     _ pictureInPictureController: AVPictureInPictureController,
     failedToStartPictureInPictureWithError error: Error
   ) {
-    startDeadline = 0
     emitError("启动画中画失败：\(error.localizedDescription)")
   }
 
