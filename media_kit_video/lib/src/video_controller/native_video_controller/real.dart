@@ -286,6 +286,24 @@ class NativeVideoController extends PlatformVideoController {
     }
   }
 
+  /// 为「换了视频源」做准备（仅 iOS）。
+  @override
+  Future<void> preparePictureInPictureForNewMedia() async {
+    if (!Platform.isIOS) {
+      return;
+    }
+    try {
+      await _channel.invokeMethod(
+        'VideoOutput.PreparePictureInPictureForNewMedia',
+        {'handle': player.handle.toString()},
+      );
+    } catch (exception) {
+      debugPrint(
+        'NativeVideoController: preparePictureInPictureForNewMedia: $exception',
+      );
+    }
+  }
+
   /// Disposes the instance. Releases allocated resources back to the system.
   Future<void> _dispose() {
     final handle = player.handle;

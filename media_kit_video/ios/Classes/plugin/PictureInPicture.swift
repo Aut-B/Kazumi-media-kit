@@ -66,9 +66,19 @@ public class PictureInPicture: NSObject {
   /// 画中画弹幕叠加层：把弹幕绘进帧副本，使系统小窗内也能看到弹幕。
   private let danmaku = DanmakuOverlay()
 
-  /// 是否处于「已武装」状态：为 true 时持续把新帧喂给 [displayLayer]。
-  /// 由 [start] / [arm] 置位，[stop] / [dispose] 复位。
+  /// 是否处于「已武装」状态：为 true 时向 [displayLayer] 提供画面帧。
+  ///
+  /// 由 [start] / [arm] 置位，只有 [disarm] / [dispose] 才会复位——**关闭小窗
+  /// （[stop]）不解除武装**。这一点很关键：解除武装意味着图层再也收不到帧，
+  /// 而 `AVPictureInPictureController` 仍在，用户随后划回主屏幕自动进入的小窗
+  /// （或再次点按「画中画」按钮）就只剩黑屏。
   public private(set) var isArmed: Bool = false
+
+  /// 上一帧对应的播放位置（秒），用于识别「换了视频源导致时间轴倒退」。
+  private var lastPosition: Double = -1
+
+  /// 上一次在「小窗未显示」状态下喂帧的时间，用于降频。
+  private var lastIdleEnqueue: CFTimeInterval = 0
 
   init(handle: OpaquePointer, eventCallback: @escaping EventCallback) {
     self.handle = handle
@@ -88,6 +98,13 @@ public class PictureInPicture: NSObject {
   public var isActive: Bool {
     return pipController?.isPictureInPictureActive ?? false
   }
+
+  /// 小窗是否正在显示。
+  ///
+  /// 由 delegate 回调在主线程维护。渲染线程需要频繁判断「小窗是否可见」来决定
+  /// 喂帧策略，而 `AVPictureInPictureController` 的属性只能在主线程访问，故这里
+  /// 用一份普通 Bool 缓存供其它线程安全读取。
+  public private(set) var isShowing: Bool = false
 
   /// 当前是否具备进入画中画的条件（图层已就绪等）。
   public var isPossible: Bool {
@@ -147,13 +164,45 @@ public class PictureInPicture: NSObject {
     }
   }
 
+  /// 关闭画中画小窗，但**保持画面源可用**。
+  ///
+  /// 用户可以随时再次点按「画中画」按钮，或划回主屏幕让系统自动进入；若此处
+  /// 一并解除武装，下一次进入的小窗就会是黑屏。
   public func stop() {
     guard #available(iOS 15.0, *) else {
       return
     }
-    isArmed = false
     DispatchQueue.main.async { [weak self] in
       self?.pipController?.stopPictureInPicture()
+    }
+  }
+
+  /// 不再向系统提供画中画画面源。仅用于释放前的收尾。
+  public func disarm() {
+    isArmed = false
+    isShowing = false
+    lastPosition = -1
+    lastIdleEnqueue = 0
+  }
+
+  /// 为「换了视频源」做准备（连播下一集、切换清晰度、换源等）。
+  ///
+  /// 新视频的播放位置从 0 开始，而图层时间轴此前已推进到上一集的位置；时间轴
+  /// 倒退会让 `AVSampleBufferDisplayLayer` 停止消化后续样本，表现即「App 里画面
+  /// 正常、小窗一直黑」。这里清空图层与时间轴，并丢掉上一集的弹幕，
+  /// 控制器本身保持不动，因此小窗会在下一帧到来后无缝接上新视频。
+  public func prepareForNewMedia() {
+    danmaku.clear()
+    lastPosition = -1
+    lastIdleEnqueue = 0
+
+    let layer = displayLayer
+    let timebase = controlTimebase
+    DispatchQueue.main.async {
+      layer.flush()
+      if #available(iOS 15.0, *), let timebase = timebase {
+        CMTimebaseSetTime(timebase, time: .zero)
+      }
     }
   }
 
@@ -162,7 +211,7 @@ public class PictureInPicture: NSObject {
   /// 可能在任意线程（`VideoOutput.deinit`）被调用，而 AVKit / UIKit 的对象只能
   /// 在主线程序列上访问，因此统一转投主线程执行。
   public func dispose() {
-    isArmed = false
+    disarm()
 
     let layer = displayLayer
     let host = hostView
@@ -234,14 +283,32 @@ public class PictureInPicture: NSObject {
       return
     }
 
+    if !isShowing {
+      // 小窗还没显示：仍要维持图层里有画面——系统正是据此判断「有内容可以画中画」，
+      // 否则划回主屏幕时不会自动进入。但降到约 10 fps，避免长时间占住 Flutter
+      // 那几个轮转使用的像素缓冲。
+      let now = CACurrentMediaTime()
+      if now - lastIdleEnqueue < 0.1 {
+        return
+      }
+      lastIdleEnqueue = now
+    }
+
     // 当前播放位置：既用于校准小窗进度条，也用于确定这一帧该显示哪些弹幕。
     let position = mpvPosition()
+    if lastPosition >= 0, position < lastPosition - 1 {
+      // 播放位置大幅倒退说明换了视频源；时间轴倒退会让图层停止消化后续样本。
+      DispatchQueue.main.async {
+        layer.flush()
+      }
+    }
+    lastPosition = position
     syncTimebase(position)
 
     // 有弹幕落在画面上时，先绘进帧的副本；否则直接使用原始帧（零额外开销）。
     // 只有小窗真的显示出来了才绘制——仅仅「武装」了自动画中画时不应白白耗电。
     var frame = pixelBuffer
-    if pipController?.isPictureInPictureActive ?? false, danmaku.enabled,
+    if isShowing, danmaku.enabled,
       danmaku.isActive(at: position),
       let composed = danmaku.composite(pixelBuffer, at: position)
     {
@@ -521,12 +588,23 @@ extension PictureInPicture: AVPictureInPictureControllerDelegate {
   public func pictureInPictureControllerDidStartPictureInPicture(
     _ pictureInPictureController: AVPictureInPictureController
   ) {
+    // 小窗已经出现，说明系统认可这个画面源。此刻无论此前状态如何，都保证图层
+    // 处于「提供画面」状态，否则小窗会定格在最后一帧、甚至全黑。
+    isArmed = true
+    isShowing = true
+    attachDisplayLayer()
+    if displayLayer.status == .failed {
+      displayLayer.flush()
+    }
+    lastPosition = -1
+    lastIdleEnqueue = 0
     eventCallback("VideoOutput.PictureInPictureStateChanged", ["active": true])
   }
 
   public func pictureInPictureControllerDidStopPictureInPicture(
     _ pictureInPictureController: AVPictureInPictureController
   ) {
+    isShowing = false
     eventCallback("VideoOutput.PictureInPictureStateChanged", ["active": false])
   }
 

@@ -73,6 +73,8 @@ public class MediaKitVideoPlugin: NSObject, FlutterPlugin {
       handleAddPictureInPictureDanmakuMethodCall(call.arguments, result)
     case "VideoOutput.ClearPictureInPictureDanmaku":
       handleClearPictureInPictureDanmakuMethodCall(call.arguments, result)
+    case "VideoOutput.PreparePictureInPictureForNewMedia":
+      handlePreparePictureInPictureForNewMediaMethodCall(call.arguments, result)
     case "Utils.EnterNativeFullscreen":
       handleEnterNativeFullscreenMethodCall(call.arguments, result)
     case "Utils.ExitNativeFullscreen":
@@ -246,6 +248,18 @@ public class MediaKitVideoPlugin: NSObject, FlutterPlugin {
       return
     }
     videoOutputManager.clearPictureInPictureDanmaku(handle: handle)
+    result(nil)
+  }
+
+  /// 为「换了视频源」做准备（保持小窗，只清上一集的残留）。
+  private func handlePreparePictureInPictureForNewMediaMethodCall(
+    _ arguments: Any?,
+    _ result: FlutterResult
+  ) {
+    guard let handle = pictureInPictureHandle(arguments, result) else {
+      return
+    }
+    videoOutputManager.preparePictureInPictureForNewMedia(handle: handle)
     result(nil)
   }
 

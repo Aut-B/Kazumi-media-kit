@@ -169,6 +169,19 @@ public class VideoOutput: NSObject {
     #endif
   }
 
+  /// 为「换了视频源」做准备（连播下一集、换源、切清晰度等）。
+  ///
+  /// 保持画中画控制器与画面源不动，只清掉上一集的残留——图层内容、时间轴与
+  /// 弹幕——这样小窗会在下一帧到来后无缝接上新视频，而不是停在黑屏。
+  /// 其它平台为空实现。
+  public func preparePictureInPictureForNewMedia() {
+    #if os(iOS)
+      worker.enqueue {
+        self.pip?.prepareForNewMedia()
+      }
+    #endif
+  }
+
   #if os(iOS)
     /// 懒创建画中画对象，保证 `arm` 与 `start` 共用同一实例。
     private func ensurePictureInPicture() -> PictureInPicture? {
@@ -278,10 +291,24 @@ public class VideoOutput: NSObject {
       currentSize = size
 
       texture.resize(size)
-      DispatchQueue.main.sync { [weak self] in
-        guard let that = self else { return }
-        // textureUpdateCallback must run on the main thread
-        that.textureUpdateCallback(that.textureId, size)
+
+      // 同下：小窗显示（App 多在后台）期间不阻塞渲染线程。
+      var pipActive = false
+      #if os(iOS)
+        pipActive = pip?.isShowing == true
+      #endif
+      if pipActive {
+        DispatchQueue.main.async { [weak self] in
+          guard let that = self else { return }
+          // textureUpdateCallback must run on the main thread
+          that.textureUpdateCallback(that.textureId, size)
+        }
+      } else {
+        DispatchQueue.main.sync { [weak self] in
+          guard let that = self else { return }
+          // textureUpdateCallback must run on the main thread
+          that.textureUpdateCallback(that.textureId, size)
+        }
       }
     }
 
@@ -293,6 +320,17 @@ public class VideoOutput: NSObject {
 
     #if os(iOS)
       feedPictureInPicture()
+
+      // 小窗显示期间改用异步通知：此时 App 多半已进入后台，主线程正忙于处理
+      // 生命周期切换，用 `sync` 会把渲染线程一起堵住 —— 表现即系统小窗停止刷新、
+      // 只剩黑屏。异步投递不会阻塞出帧，主线程空闲时自然消化。
+      if pip?.isShowing == true {
+        DispatchQueue.main.async { [weak self] in
+          guard let that = self else { return }
+          that.registry.textureFrameAvailable(that.textureId)
+        }
+        return
+      }
     #endif
 
     DispatchQueue.main.sync { [weak self] in

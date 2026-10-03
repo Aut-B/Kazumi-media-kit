@@ -100,6 +100,15 @@ abstract class PlatformVideoController {
   /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台为空实现。
   Future<void> clearPictureInPictureDanmaku() => Future.value();
 
+  /// 为「换了视频源」做准备（连播下一集、换源、切清晰度等）。
+  ///
+  /// 保持画中画控制器与画面源不动，只清掉上一集的残留——图层内容、时间轴与弹幕。
+  /// 新视频的播放位置从 0 开始，若不清空，时间轴倒退会让画面图层停止刷新，
+  /// 表现为「App 内画面正常、系统小窗一直黑屏」。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台为空实现。
+  Future<void> preparePictureInPictureForNewMedia() => Future.value();
+
   /// A [Future] that completes when the first video frame has been rendered.
   Future<void> get waitUntilFirstFrameRendered =>
       waitUntilFirstFrameRenderedCompleter.future;

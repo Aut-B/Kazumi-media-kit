@@ -83,6 +83,13 @@ public class VideoOutputManager: NSObject {
     self.videoOutputs[handle]?.clearPictureInPictureDanmaku()
   }
 
+  /// 为「换了视频源」做准备（保持小窗，只清上一集的图层内容 / 时间轴 / 弹幕）。
+  public func preparePictureInPictureForNewMedia(
+    handle: Int64
+  ) {
+    self.videoOutputs[handle]?.preparePictureInPictureForNewMedia()
+  }
+
   public func setSize(
     handle: Int64,
     width: Int64?,
