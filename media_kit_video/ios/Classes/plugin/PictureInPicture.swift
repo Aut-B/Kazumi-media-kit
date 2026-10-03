@@ -373,7 +373,7 @@ public class PictureInPicture: NSObject {
       NSLog("PictureInPicture: CMTimebaseCreateWithSourceClock failed: \(status)")
       return
     }
-    CMTimebaseSetRate(timebase, 1.0)
+    CMTimebaseSetRate(timebase, rate: 1.0)
     displayLayer.controlTimebase = timebase
     controlTimebase = timebase
   }
@@ -388,9 +388,9 @@ public class PictureInPicture: NSObject {
       timebase,
       time: CMTime(seconds: position, preferredTimescale: 600)
     )
-    let rate: Float = mpvFlag("pause") ? 0 : 1
+    let rate: Double = mpvFlag("pause") ? 0 : 1
     if CMTimebaseGetRate(timebase) != rate {
-      CMTimebaseSetRate(timebase, rate)
+      CMTimebaseSetRate(timebase, rate: rate)
     }
   }
 
