@@ -41,16 +41,24 @@ public class PictureInPicture: NSObject {
   /// 系统在判定画中画是否可用时，要求画面源位于视图层级中**且可见**；若把图层直接
   /// 塞在 Flutter 视图之下（完全被遮挡），系统可能认为「画面不可见」而拒绝启动
   /// 画中画。因此这里用一个 2×2 点的宿主视图挂在 Flutter 视图**之上**：
-  /// 尺寸极小（约几个像素）因而观感上无影响，同时满足可见性判定。
+  /// 尺寸极小（2 点见方），但它的面积上会实时显示当前视频帧——若照常渲染，
+  /// 屏幕上就会多出一个深色小点（浅色页面上尤其显眼）。因此整棵子树压到近乎
+  /// 全透明：图层照常渲染、照常有内容，系统对画面源的判定不受影响，而肉眼
+  /// 看不到任何东西。个别机型若对透明度敏感，启动阶梯会临时把它提回不透明。
   ///
-  /// 位置取「屏幕左边缘、纵向落在视频画面内」——既避开了圆角与刘海被裁掉的
-  /// 区域，又因叠在视频之上而与画面融为一体。
+  /// 位置取「窗口正中」：无论窗口是铺满屏幕、还是被宿主进程以「场景托管」的
+  /// 方式嵌在它自己的窗口里，画面源都必定落在可见范围内。
   private lazy var hostView: UIView = {
     let view = UIView(frame: .zero)
     view.isUserInteractionEnabled = false
     view.backgroundColor = .clear
+    view.alpha = PictureInPicture.hostIdleAlpha
     return view
   }()
+
+  /// 宿主视图常态下的不透明度：低到肉眼不可见，又不为 0，以免被系统当成
+  /// 「画面源不可见」而拒绝启动画中画。
+  private static let hostIdleAlpha: CGFloat = 0.02
 
   /// 画中画控制器（iOS 15+ 才会创建）。
   private var pipController: AVPictureInPictureController?
@@ -274,6 +282,9 @@ public class PictureInPicture: NSObject {
     // 时放大一档（对已经就绪的设备没有任何影响）。
     if startTries >= 2, hostSide < 64 {
       hostSide = hostSide < 24 ? 24 : 64
+      // 与放大同步把不透明度提回来：万一「近乎全透明」在个别机型上被判成
+      // 「画面源不可见」，这一步就是兜底。小窗弹出后 [didStart] 会立刻降回去。
+      hostView.alpha = 1
       attachDisplayLayer()
     }
 
@@ -334,6 +345,8 @@ public class PictureInPicture: NSObject {
     startDeadline = 0
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
+      // 取消可能半途而废的启动阶梯留下的「提亮」状态。
+      self.hostView.alpha = PictureInPicture.hostIdleAlpha
       self.stopKeepAlive()
       self.pipController?.stopPictureInPicture()
     }
@@ -348,6 +361,7 @@ public class PictureInPicture: NSObject {
     startDeadline = 0
     showingSince = 0
     DispatchQueue.main.async { [weak self] in
+      self?.hostView.alpha = PictureInPicture.hostIdleAlpha
       self?.stopKeepAlive()
     }
   }
@@ -990,6 +1004,8 @@ extension PictureInPicture: AVPictureInPictureControllerDelegate {
     isShowing = true
     startDeadline = 0
     lastGoodHostSide = hostSide
+    // 启动阶梯可能为了兜底把它提亮过；小窗已经在外面显示，屏幕上不该再留这个小点。
+    hostView.alpha = PictureInPicture.hostIdleAlpha
     possibleCache = pipController?.isPictureInPicturePossible ?? true
     resetDiagnostics()
     showingSince = CACurrentMediaTime()
