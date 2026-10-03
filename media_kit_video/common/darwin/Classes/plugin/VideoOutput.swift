@@ -196,25 +196,45 @@ public class VideoOutput: NSObject {
   }
 
   #if os(iOS)
+    /// 把最新渲染完成的一帧喂给画中画图层。
+    ///
+    /// - Parameter force: 绕过「小窗未显示时降频」的限制，用于启动阶段主动补帧。
+    private func feedPictureInPicture(force: Bool = false) {
+      guard let instance = self.pip, instance.isArmed else {
+        return
+      }
+      guard let pixelBuffer = self.texture?.copyPixelBuffer()?
+        .takeRetainedValue()
+      else {
+        // 渲染回调明明来过了，却取不到像素缓冲：记一笔，用于区分「没出帧」与
+        // 「出了帧但拿不到画面」——这两种情况的成因完全不同。
+        instance.noteCopyNil()
+        return
+      }
+      instance.enqueue(pixelBuffer, force: force)
+    }
+
     /// 懒创建画中画对象，保证 `arm` 与 `start` 共用同一实例。
     private func ensurePictureInPicture() -> PictureInPicture? {
-      if let pip = self.pip {
-        return pip
+      if let existing = self.pip {
+        return existing
       }
-      let pip = PictureInPicture(
+      let instance = PictureInPicture(
         handle: self.handle,
         eventCallback: self.pipEventCallback
       )
       // 启动阶段需要主动补帧（系统靠「图层里有没有画面」判定画中画可用性）。
       // 取像素缓冲必须走渲染线程，因此这里只回投一个任务。
-      pip.onNeedFrame = { [weak self] in
-        guard let that = self else { return }
-        that.worker.enqueue {
+      instance.onNeedFrame = { [weak self] () -> Void in
+        guard let that = self else {
+          return
+        }
+        that.worker.enqueue { () -> Void in
           that.feedPictureInPicture(force: true)
         }
       }
-      self.pip = pip
-      return pip
+      self.pip = instance
+      return instance
     }
   #endif
 
@@ -374,26 +394,7 @@ public class VideoOutput: NSObject {
     }
   }
 
-  #if os(iOS)
-    /// 把最新渲染完成的一帧喂给画中画图层。
-    ///
-    /// - Parameter force: 绕过「小窗未显示时降频」的限制，用于启动阶段主动补帧。
-    private func feedPictureInPicture(force: Bool = false) {
-      guard let pip = pip, pip.isArmed else {
-        return
-      }
-      guard let pixelBuffer = texture?.copyPixelBuffer()?.takeRetainedValue()
-      else {
-        // 渲染回调明明来过了，却取不到像素缓冲：记一笔，用于区分「没出帧」与
-        // 「出了帧但拿不到画面」——这两种情况的成因完全不同。
-        pip.noteCopyNil()
-        return
-      }
-      pip.enqueue(pixelBuffer, force: force)
-    }
-  #endif
-
-    private var videoSize: CGSize {
+  private var videoSize: CGSize {
         // fixed size
         if width != nil && height != nil {
             return CGSize(
