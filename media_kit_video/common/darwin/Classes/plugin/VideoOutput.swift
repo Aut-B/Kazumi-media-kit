@@ -201,12 +201,12 @@ public class VideoOutput: NSObject {
         handle: self.handle,
         eventCallback: self.pipEventCallback
       )
-      // 启动阶段需要主动补帧（系统靠「图层里有没有画面」判定画中画可用性）。
-      // 取像素缓冲必须走渲染线程，因此这里只回投一个任务。
-      pip.onNeedFrame = { [weak self] in
+      // 启动阶段与小窗保活都会走这里：前者需要「强势补帧」（图层不就绪也要送进去），
+      // 后者走温和路径即可。取像素缓冲必须走渲染线程，因此这里只回投一个任务。
+      pip.onNeedFrame = { [weak self] force in
         guard let that = self else { return }
         that.worker.enqueue {
-          that.feedPictureInPicture(force: true)
+          that.feedPictureInPicture(force: force)
         }
       }
       self.pip = pip
@@ -367,6 +367,9 @@ public class VideoOutput: NSObject {
       }
       guard let pixelBuffer = texture?.copyPixelBuffer()?.takeRetainedValue()
       else {
+        // 渲染回调明明来过了，却取不到像素缓冲：记一笔，用于区分「没出帧」与
+        // 「出了帧但拿不到画面」——这两种情况的成因完全不同。
+        pip.noteCopyNil()
         return
       }
       pip.enqueue(pixelBuffer, force: force)
