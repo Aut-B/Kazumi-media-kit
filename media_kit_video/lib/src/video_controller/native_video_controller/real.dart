@@ -211,6 +211,23 @@ class NativeVideoController extends PlatformVideoController {
     }
   }
 
+  /// 画中画诊断快照（仅 iOS）。
+  @override
+  Future<Map<String, Object?>> pictureInPictureDiagnostics() async {
+    if (!Platform.isIOS) {
+      return const {};
+    }
+    try {
+      final value = await _channel.invokeMapMethod<String, Object?>(
+        'VideoOutput.PictureInPictureDiagnostics',
+        {'handle': player.handle.toString()},
+      );
+      return value ?? const {};
+    } catch (_) {
+      return const {};
+    }
+  }
+
   /// 开启 / 关闭画中画弹幕（仅 iOS）。
   @override
   Future<void> setPictureInPictureDanmakuEnabled(bool value) async {

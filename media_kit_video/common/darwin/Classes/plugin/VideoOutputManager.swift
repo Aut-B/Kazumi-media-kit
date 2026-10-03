@@ -52,6 +52,13 @@ public class VideoOutputManager: NSObject {
     return self.videoOutputs[handle]?.isPictureInPicturePossible() ?? false
   }
 
+  /// 画中画诊断快照。
+  public func pictureInPictureDiagnostics(
+    handle: Int64
+  ) -> [String: Any] {
+    return self.videoOutputs[handle]?.pictureInPictureDiagnostics() ?? [:]
+  }
+
   /// 开启 / 关闭画中画弹幕。
   public func setPictureInPictureDanmakuEnabled(
     handle: Int64,

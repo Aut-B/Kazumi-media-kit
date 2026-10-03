@@ -133,6 +133,15 @@ public class VideoOutput: NSObject {
     #endif
   }
 
+  /// 画中画诊断快照（小窗黑屏时用来定位断点）。其它平台返回空表。
+  public func pictureInPictureDiagnostics() -> [String: Any] {
+    #if os(iOS)
+      return self.pip?.diagnostics() ?? [:]
+    #else
+      return [:]
+    #endif
+  }
+
   /// 开启 / 关闭画中画弹幕。其它平台为空实现。
   public func setPictureInPictureDanmakuEnabled(_ value: Bool) {
     #if os(iOS)

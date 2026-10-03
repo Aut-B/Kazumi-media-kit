@@ -80,6 +80,27 @@ public class PictureInPicture: NSObject {
   /// 上一次在「小窗未显示」状态下喂帧的时间，用于降频。
   private var lastIdleEnqueue: CFTimeInterval = 0
 
+  // MARK: - 诊断计数
+  //
+  // 「小窗黑屏」可能断在好几处：渲染回调根本没出帧、图层拒绝接收样本、样本已经
+  // 入队但系统没把画面接进小窗……单看现象无法区分。这几个计数与 [diagnostics] 用来
+  // 把断点定位到具体一环，平时不参与播放逻辑。
+
+  /// [enqueue] 被调用的次数，即渲染回调实际出帧数。
+  private var statAttempt = 0
+  /// 真正交给图层的样本数。
+  private var statEnqueued = 0
+  /// 因图层 `isReadyForMoreMediaData == false` 被丢弃的次数。
+  private var statNotReady = 0
+  /// 因尚未「武装」被丢弃的次数。
+  private var statNotArmed = 0
+  /// 因小窗未显示而降频丢弃的次数。
+  private var statThrottled = 0
+  /// 最近一次「图层不就绪」的起始时刻。
+  private var notReadySince: CFTimeInterval = 0
+  /// 最近一次因「图层长时间不就绪」触发 flush 的时刻。
+  private var lastStuckFlush: CFTimeInterval = 0
+
   init(handle: OpaquePointer, eventCallback: @escaping EventCallback) {
     self.handle = handle
     self.eventCallback = eventCallback
@@ -126,6 +147,7 @@ public class PictureInPicture: NSObject {
     }
 
     isArmed = true
+    resetDiagnostics()
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
       guard let controller = self._ensureController() else {
@@ -273,15 +295,36 @@ public class PictureInPicture: NSObject {
     guard #available(iOS 15.0, *) else {
       return
     }
+    statAttempt += 1
+
     guard isArmed else {
+      statNotArmed += 1
       return
     }
 
     // 图层尚未消化完上一帧时直接丢弃，避免堆积与卡顿。
     let layer = displayLayer
     if !layer.isReadyForMoreMediaData {
+      statNotReady += 1
+      // 小窗已经显示、图层却长时间不肯接收样本：多半是早先那批样本卡在队列里
+      // （时间轴倒退、或渲染在后台被挂起），此时队列永远不会自己腾空。主动清一次，
+      // 把管道重新打通，否则小窗会一直停在黑屏。
+      let now = CACurrentMediaTime()
+      if isShowing {
+        if notReadySince == 0 {
+          notReadySince = now
+        } else if now - notReadySince > 1.0, now - lastStuckFlush > 2.0 {
+          lastStuckFlush = now
+          notReadySince = 0
+          NSLog("PictureInPicture: layer stuck, flushing")
+          DispatchQueue.main.async {
+            layer.flush()
+          }
+        }
+      }
       return
     }
+    notReadySince = 0
 
     if !isShowing {
       // 小窗还没显示：仍要维持图层里有画面——系统正是据此判断「有内容可以画中画」，
@@ -289,6 +332,7 @@ public class PictureInPicture: NSObject {
       // 那几个轮转使用的像素缓冲。
       let now = CACurrentMediaTime()
       if now - lastIdleEnqueue < 0.1 {
+        statThrottled += 1
         return
       }
       lastIdleEnqueue = now
@@ -366,6 +410,7 @@ public class PictureInPicture: NSObject {
       )
     }
 
+    statEnqueued += 1
     DispatchQueue.main.async {
       if layer.status == .failed {
         layer.flush()
@@ -422,6 +467,53 @@ public class PictureInPicture: NSObject {
 
   public func clearDanmaku() {
     danmaku.clear()
+  }
+
+  // MARK: - 诊断
+
+  /// 重置诊断计数（每次真正发起 / 进入画中画时调用）。
+  private func resetDiagnostics() {
+    statAttempt = 0
+    statEnqueued = 0
+    statNotReady = 0
+    statNotArmed = 0
+    statThrottled = 0
+    notReadySince = 0
+    lastStuckFlush = 0
+  }
+
+  /// 诊断快照：用于判断「小窗黑屏」断在哪一环。**必须在主线程调用**
+  /// （内部会读取 `AVPictureInPictureController` 与图层的状态）。
+  public func diagnostics() -> [String: Any] {
+    let layer = displayLayer
+    let status: String
+    switch layer.status {
+    case .failed:
+      status = "failed"
+    case .rendering:
+      status = "rendering"
+    default:
+      status = "unknown"
+    }
+    var rate: Double = -1
+    if #available(iOS 15.0, *), let timebase = controlTimebase {
+      rate = CMTimebaseGetRate(timebase)
+    }
+    return [
+      "armed": isArmed,
+      "showing": isShowing,
+      "possible": isPossible,
+      "attempt": statAttempt,
+      "enqueued": statEnqueued,
+      "notReady": statNotReady,
+      "notArmed": statNotArmed,
+      "throttled": statThrottled,
+      "layerStatus": status,
+      "layerReady": layer.isReadyForMoreMediaData,
+      "paused": mpvFlag("pause"),
+      "position": mpvPosition(),
+      "timebaseRate": rate,
+    ]
   }
 
   // MARK: - 内部
@@ -592,6 +684,7 @@ extension PictureInPicture: AVPictureInPictureControllerDelegate {
     // 处于「提供画面」状态，否则小窗会定格在最后一帧、甚至全黑。
     isArmed = true
     isShowing = true
+    resetDiagnostics()
     attachDisplayLayer()
     if displayLayer.status == .failed {
       displayLayer.flush()

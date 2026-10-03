@@ -63,6 +63,8 @@ public class MediaKitVideoPlugin: NSObject, FlutterPlugin {
       handleSetAutoEnterPictureInPictureMethodCall(call.arguments, result)
     case "VideoOutput.IsPictureInPicturePossible":
       handleIsPictureInPicturePossibleMethodCall(call.arguments, result)
+    case "VideoOutput.PictureInPictureDiagnostics":
+      handlePictureInPictureDiagnosticsMethodCall(call.arguments, result)
     case "VideoOutput.IsPictureInPictureSupported":
       result(VideoOutput.isPictureInPictureSupported)
     case "VideoOutput.SetPictureInPictureDanmakuEnabled":
@@ -186,6 +188,17 @@ public class MediaKitVideoPlugin: NSObject, FlutterPlugin {
       return nil
     }
     return handle
+  }
+
+  /// 画中画诊断快照（真机排障用）。
+  private func handlePictureInPictureDiagnosticsMethodCall(
+    _ arguments: Any?,
+    _ result: FlutterResult
+  ) {
+    guard let handle = pictureInPictureHandle(arguments, result) else {
+      return
+    }
+    result(videoOutputManager.pictureInPictureDiagnostics(handle: handle))
   }
 
   /// 画中画弹幕开关。

@@ -68,6 +68,16 @@ abstract class PlatformVideoController {
   /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台恒为 `false`。
   Future<bool> isPictureInPicturePossible() => Future.value(false);
 
+  /// 画中画诊断快照，用于判断「小窗黑屏」断在哪一环。
+  ///
+  /// 常见字段：`attempt`（渲染回调出帧次数）、`enqueued`（真正交给图层的帧数）、
+  /// `notReady`（图层拒收次数）、`layerStatus`（`rendering` / `failed` /
+  /// `unknown`）、`layerReady`、`showing`（小窗是否已显示）。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台返回空表。
+  Future<Map<String, Object?>> pictureInPictureDiagnostics() =>
+      Future.value(const {});
+
   /// 开启 / 关闭画中画弹幕。
   ///
   /// 系统画中画小窗只显示原生画面图层的内容，Flutter 侧绘制的弹幕画布不会被带
