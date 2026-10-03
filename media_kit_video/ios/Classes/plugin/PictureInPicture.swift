@@ -43,8 +43,8 @@ public class PictureInPicture: NSObject {
   /// 画中画。因此这里用一个 2×2 点的宿主视图挂在 Flutter 视图**之上**：
   /// 尺寸极小（约几个像素）因而观感上无影响，同时满足可见性判定。
   ///
-  /// 位置取「屏幕左边缘垂直居中」——避开了圆角与刘海区域，任何机型、任何方向下
-  /// 都确实处于可见区域内。
+  /// 位置取「屏幕左边缘、纵向落在视频画面内」——既避开了圆角与刘海被裁掉的
+  /// 区域，又因叠在视频之上而与画面融为一体。
   private lazy var hostView: UIView = {
     let view = UIView(frame: .zero)
     view.isUserInteractionEnabled = false
@@ -292,6 +292,8 @@ public class PictureInPicture: NSObject {
     }
 
     // 只在极小的可见区域内显示（约几个像素），因此不会影响应用内观感。
+    // 纵向位置取「安全区顶部」与 60 点中的较大者：竖屏时落在视频画面内（与画面
+    // 融为一体），横屏时也足以避开圆角被裁掉的区域。
     let side: CGFloat = 2
     if hostView.superview !== window {
       hostView.removeFromSuperview()
@@ -300,7 +302,7 @@ public class PictureInPicture: NSObject {
     }
     hostView.frame = CGRect(
       x: 0,
-      y: window.bounds.midY,
+      y: max(window.safeAreaInsets.top, 60),
       width: side,
       height: side
     )
