@@ -201,6 +201,14 @@ public class VideoOutput: NSObject {
         handle: self.handle,
         eventCallback: self.pipEventCallback
       )
+      // 启动阶段需要主动补帧（系统靠「图层里有没有画面」判定画中画可用性）。
+      // 取像素缓冲必须走渲染线程，因此这里只回投一个任务。
+      pip.onNeedFrame = { [weak self] in
+        guard let that = self else { return }
+        that.worker.enqueue {
+          that.feedPictureInPicture(force: true)
+        }
+      }
       self.pip = pip
       return pip
     }
@@ -351,7 +359,9 @@ public class VideoOutput: NSObject {
 
   #if os(iOS)
     /// 把最新渲染完成的一帧喂给画中画图层。
-    private func feedPictureInPicture() {
+    ///
+    /// - Parameter force: 绕过「小窗未显示时降频」的限制，用于启动阶段主动补帧。
+    private func feedPictureInPicture(force: Bool = false) {
       guard let pip = pip, pip.isArmed else {
         return
       }
@@ -359,7 +369,7 @@ public class VideoOutput: NSObject {
       else {
         return
       }
-      pip.enqueue(pixelBuffer)
+      pip.enqueue(pixelBuffer, force: force)
     }
   #endif
 
