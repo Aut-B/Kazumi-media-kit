@@ -169,4 +169,74 @@ class VideoController {
     final instance = await platform.future;
     return instance.waitUntilFirstFrameRendered;
   }
+
+  /// 当前平台 / 设备是否支持系统级画中画。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台恒为 `false`。
+  Future<bool> isPictureInPictureSupported() async {
+    final instance = await platform.future;
+    return instance.isPictureInPictureSupported();
+  }
+
+  /// 进入 / 退出系统级画中画。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台为空实现。
+  Future<void> setPictureInPicture(bool value) async {
+    final instance = await platform.future;
+    return instance.setPictureInPicture(value);
+  }
+
+  /// 「武装」自动画中画：不立即弹出小窗，而是在用户划回主屏幕时由系统自动进入。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台为空实现。
+  Future<void> setAutoEnterPictureInPicture(bool value) async {
+    final instance = await platform.future;
+    return instance.setAutoEnterPictureInPicture(value);
+  }
+
+  /// 当前是否具备进入画中画的条件（图层已就绪、已渲染首帧等）。
+  Future<bool> isPictureInPicturePossible() async {
+    final instance = await platform.future;
+    return instance.isPictureInPicturePossible();
+  }
+
+  /// 画中画诊断快照，用于判断「小窗黑屏」断在哪一环。
+  Future<Map<String, Object?>> pictureInPictureDiagnostics() async {
+    final instance = await platform.future;
+    return instance.pictureInPictureDiagnostics();
+  }
+
+  /// 开启 / 关闭画中画弹幕。
+  Future<void> setPictureInPictureDanmakuEnabled(bool value) async {
+    final instance = await platform.future;
+    return instance.setPictureInPictureDanmakuEnabled(value);
+  }
+
+  /// 下发画中画弹幕的显示参数。
+  Future<void> setPictureInPictureDanmakuConfig(
+    Map<String, Object> config,
+  ) async {
+    final instance = await platform.future;
+    return instance.setPictureInPictureDanmakuConfig(config);
+  }
+
+  /// 追加画中画弹幕数据。
+  Future<void> addPictureInPictureDanmaku(
+    List<Map<String, Object>> items,
+  ) async {
+    final instance = await platform.future;
+    return instance.addPictureInPictureDanmaku(items);
+  }
+
+  /// 清空已缓存的画中画弹幕数据（切换视频时调用）。
+  Future<void> clearPictureInPictureDanmaku() async {
+    final instance = await platform.future;
+    return instance.clearPictureInPictureDanmaku();
+  }
+
+  /// 为「换了视频源」做准备（连播下一集、换源、切清晰度等）。
+  Future<void> preparePictureInPictureForNewMedia() async {
+    final instance = await platform.future;
+    return instance.preparePictureInPictureForNewMedia();
+  }
 }
