@@ -63,9 +63,6 @@ public class PictureInPicture: NSObject {
   /// 的 `time-pos` 校准。
   private var controlTimebase: CMTimebase?
 
-  /// 画中画弹幕叠加层：把弹幕绘进帧副本，使系统小窗内也能看到弹幕。
-  private let danmaku = DanmakuOverlay()
-
   /// 是否处于「已武装」状态：为 true 时向 [displayLayer] 提供画面帧。
   ///
   /// 由 [start] / [arm] 置位，只有 [disarm] / [dispose] 才会复位——**关闭小窗
@@ -331,7 +328,6 @@ public class PictureInPicture: NSObject {
   /// 正常、小窗一直黑」。这里清空图层与时间轴，并丢掉上一集的弹幕，
   /// 控制器本身保持不动，因此小窗会在下一帧到来后无缝接上新视频。
   public func prepareForNewMedia() {
-    danmaku.clear()
     lastPosition = -1
     lastIdleEnqueue = 0
 
@@ -468,13 +464,7 @@ public class PictureInPicture: NSObject {
 
     // 有弹幕落在画面上时，先绘进帧的副本；否则直接使用原始帧（零额外开销）。
     // 只有小窗真的显示出来了才绘制——仅仅「武装」了自动画中画时不应白白耗电。
-    var frame = pixelBuffer
-    if isShowing, danmaku.enabled,
-      danmaku.isActive(at: position),
-      let composed = danmaku.composite(pixelBuffer, at: position)
-    {
-      frame = composed
-    }
+    let frame = pixelBuffer
 
     var formatDescription: CMVideoFormatDescription?
     let formatStatus = CMVideoFormatDescriptionCreateForImageBuffer(
@@ -537,54 +527,16 @@ public class PictureInPicture: NSObject {
   }
 
   // MARK: - 弹幕
+  //
+  // 小窗弹幕需要把文字绘进每一帧的副本，本轮先不接入：接口保留，Dart 侧调用为空操作。
 
-  /// 开启 / 关闭画中画弹幕。关闭后所有帧都按原样送入小窗。
-  public func setDanmakuEnabled(_ value: Bool) {
-    danmaku.enabled = value
-  }
+  public func setDanmakuEnabled(_ value: Bool) {}
 
-  /// 下发弹幕显示参数（字号缩放、透明度、滚动时长等），与 App 内的弹幕设置保持一致。
-  public func setDanmakuConfig(_ config: [String: Any]) {
-    if let value = config["opacity"] as? NSNumber {
-      danmaku.opacity = CGFloat(max(0, min(1, value.doubleValue)))
-    }
-    if let value = config["fontScale"] as? NSNumber {
-      danmaku.fontScale = CGFloat(max(0.35, min(4, value.doubleValue)))
-    }
-    if let value = config["lineHeight"] as? NSNumber {
-      danmaku.lineHeightScale = CGFloat(max(0.5, min(3, value.doubleValue)))
-    }
-    if let value = config["area"] as? NSNumber {
-      danmaku.area = CGFloat(value.doubleValue)
-    }
-    if let value = config["duration"] as? NSNumber {
-      danmaku.duration = max(1, value.doubleValue)
-    }
-    if let value = config["staticDuration"] as? NSNumber {
-      danmaku.staticDuration = max(0.5, value.doubleValue)
-    }
-    if let value = config["strokeWidth"] as? NSNumber {
-      danmaku.strokeWidth = CGFloat(value.doubleValue)
-    }
-    if let value = config["hideScroll"] as? NSNumber {
-      danmaku.hideScroll = value.boolValue
-    }
-    if let value = config["hideTop"] as? NSNumber {
-      danmaku.hideTop = value.boolValue
-    }
-    if let value = config["hideBottom"] as? NSNumber {
-      danmaku.hideBottom = value.boolValue
-    }
-  }
+  public func setDanmakuConfig(_ config: [String: Any]) {}
 
-  /// 追加一批弹幕。同一 `id` 只入库一次，因此拖动进度条后重复下发不会重影。
-  public func addDanmaku(_ items: [[String: Any]]) {
-    danmaku.append(items)
-  }
+  public func addDanmaku(_ items: [[String: Any]]) {}
 
-  public func clearDanmaku() {
-    danmaku.clear()
-  }
+  public func clearDanmaku() {}
 
   // MARK: - 诊断
 
