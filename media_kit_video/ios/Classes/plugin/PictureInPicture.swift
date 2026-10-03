@@ -151,11 +151,17 @@ public class PictureInPicture: NSObject {
   /// 保活定时器实际触发次数。
   private var statTimerTicks = 0
 
-  /// 播放类音频会话当前是否处于活跃状态。
+  /// 播放类音频会话是否已成功激活（记录最近一次激活尝试的结果）。
   ///
   /// 画中画要求 App 持有活跃的播放类会话；后台态下激活可能失败，而系统此时可能
   /// 只给出一个「有框无画面」的小窗。纳入诊断，便于把这第二种成因与图层问题区分开。
+  /// 注：`AVAudioSession` 没有公开 API 能查询「当前是否活跃」，因此只能记自己那
+  /// 一次 `setActive(true)` 的结果。
   private var audioSessionActive = false
+
+  /// 最近一次激活音频会话时，系统是否报告「另有音频在播放」。
+  /// 为真说明会话正被别的 App 占着，这本身就可能导致小窗拿不到画面。
+  private var audioOtherPlaying = false
 
   /// 因图层「需要先清空队列才能恢复解码」而主动 flush 的次数。
   private var statResumeFlush = 0
@@ -665,7 +671,7 @@ public class PictureInPicture: NSObject {
     return [
       "帧入图层 \(statEnqueued)/\(statAttempt)",
       "拒收 \(statNotReady) · 恢复冲洗 \(statResumeFlush) · 就绪 \(layer.isReadyForMoreMediaData ? 1 : 0)",
-      "小窗 \(isShowing ? 1 : 0) · 武装 \(isArmed ? 1 : 0) · 可画 \(possibleCache ? 1 : 0) · 声 \(audioSessionActive ? 1 : 0)",
+      "小窗 \(isShowing ? 1 : 0) · 武装 \(isArmed ? 1 : 0) · 可画 \(possibleCache ? 1 : 0) · 声 \(audioSessionActive ? 1 : 0)/\(audioOtherPlaying ? 1 : 0)",
       "保活 \(statTimerTicks) · \(size)",
     ]
   }
@@ -734,6 +740,7 @@ public class PictureInPicture: NSObject {
       "windowBounds": windowBounds,
       "appState": appStateText(),
       "audioActive": audioSessionActive,
+      "audioOtherPlaying": audioOtherPlaying,
       "layerStatus": layerStatusText(),
       "layerReady": layer.isReadyForMoreMediaData,
       "layerHidden": layer.isHidden,
@@ -755,7 +762,8 @@ public class PictureInPicture: NSObject {
       let session = AVAudioSession.sharedInstance()
       try session.setCategory(.playback, mode: .moviePlayback)
       try session.setActive(true)
-      audioSessionActive = session.isActive
+      audioSessionActive = true
+      audioOtherPlaying = session.isOtherAudioPlaying
     } catch {
       audioSessionActive = false
       NSLog("PictureInPicture: AVAudioSession error: \(error)")
