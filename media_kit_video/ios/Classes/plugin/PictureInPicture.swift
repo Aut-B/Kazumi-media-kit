@@ -239,9 +239,9 @@ public class PictureInPicture: NSObject {
 
     // 阶梯走到尽头：把判断依据一并报出来，免得又只能靠猜。
     emitError(
-      "画中画启动失败：系统判定画面源未就绪（出帧 \(statAttempt) 次、"
-        + "入队 \(statEnqueued) 帧、图层拒收 \(statNotReady) 次、"
-        + "图层 \(layerStatusText())、就绪 \(displayLayer.isReadyForMoreMediaData)）"
+      "画中画启动失败：画面源未就绪（出帧 \(statAttempt)、入队 \(statEnqueued) 帧、"
+        + "图层 \(layerStatusText())、就绪 \(displayLayer.isReadyForMoreMediaData)、"
+        + "已挂入层级 \(hostView.window != nil)、App \(appStateText())）"
     )
     hostSide = lastGoodHostSide
     attachDisplayLayer()
@@ -592,6 +592,20 @@ public class PictureInPicture: NSObject {
     }
   }
 
+  /// App 当前运行状态的文字描述（用于诊断）。**必须在主线程调用**。
+  private func appStateText() -> String {
+    switch UIApplication.shared.applicationState {
+    case .active:
+      return "active"
+    case .inactive:
+      return "inactive"
+    case .background:
+      return "background"
+    default:
+      return "unknown"
+    }
+  }
+
   /// 诊断快照：用于判断「小窗黑屏」断在哪一环。**必须在主线程调用**
   /// （内部会读取 `AVPictureInPictureController` 与图层的状态）。
   public func diagnostics() -> [String: Any] {
@@ -612,6 +626,9 @@ public class PictureInPicture: NSObject {
       "throttled": statThrottled,
       "startTries": startTries,
       "hostSide": Double(hostSide),
+      // 画面源是否真的挂进了窗口（false = 被移除或窗口还没就绪）。
+      "hostAttached": hostView.window != nil,
+      "appState": appStateText(),
       "layerStatus": layerStatusText(),
       "layerReady": layer.isReadyForMoreMediaData,
       "paused": mpvFlag("pause"),
