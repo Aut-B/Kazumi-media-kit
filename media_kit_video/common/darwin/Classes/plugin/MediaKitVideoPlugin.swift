@@ -65,6 +65,14 @@ public class MediaKitVideoPlugin: NSObject, FlutterPlugin {
       handleIsPictureInPicturePossibleMethodCall(call.arguments, result)
     case "VideoOutput.IsPictureInPictureSupported":
       result(VideoOutput.isPictureInPictureSupported)
+    case "VideoOutput.SetPictureInPictureDanmakuEnabled":
+      handleSetPictureInPictureDanmakuEnabledMethodCall(call.arguments, result)
+    case "VideoOutput.SetPictureInPictureDanmakuConfig":
+      handleSetPictureInPictureDanmakuConfigMethodCall(call.arguments, result)
+    case "VideoOutput.AddPictureInPictureDanmaku":
+      handleAddPictureInPictureDanmakuMethodCall(call.arguments, result)
+    case "VideoOutput.ClearPictureInPictureDanmaku":
+      handleClearPictureInPictureDanmakuMethodCall(call.arguments, result)
     case "Utils.EnterNativeFullscreen":
       handleEnterNativeFullscreenMethodCall(call.arguments, result)
     case "Utils.ExitNativeFullscreen":
@@ -154,6 +162,90 @@ public class MediaKitVideoPlugin: NSObject, FlutterPlugin {
       handle: handle!
     )
 
+    result(nil)
+  }
+
+  /// 从调用参数里取出 handle。
+  private func pictureInPictureHandle(
+    _ arguments: Any?,
+    _ result: FlutterResult
+  ) -> Int64? {
+    let args = arguments as? [String: Any]
+    guard let handleStr = args?["handle"] as? String,
+      let handle = Int64(handleStr)
+    else {
+      result(
+        FlutterError(
+          code: "invalid_args",
+          message: "handle must be an Int64",
+          details: nil
+        )
+      )
+      return nil
+    }
+    return handle
+  }
+
+  /// 画中画弹幕开关。
+  private func handleSetPictureInPictureDanmakuEnabledMethodCall(
+    _ arguments: Any?,
+    _ result: FlutterResult
+  ) {
+    guard let handle = pictureInPictureHandle(arguments, result) else {
+      return
+    }
+    let args = arguments as? [String: Any]
+    let value = (args?["value"] as? Bool) ?? false
+    videoOutputManager.setPictureInPictureDanmakuEnabled(
+      handle: handle,
+      value: value
+    )
+    result(nil)
+  }
+
+  /// 画中画弹幕显示参数。
+  private func handleSetPictureInPictureDanmakuConfigMethodCall(
+    _ arguments: Any?,
+    _ result: FlutterResult
+  ) {
+    guard let handle = pictureInPictureHandle(arguments, result) else {
+      return
+    }
+    let args = arguments as? [String: Any]
+    let config = (args?["value"] as? [String: Any]) ?? [:]
+    videoOutputManager.setPictureInPictureDanmakuConfig(
+      handle: handle,
+      config: config
+    )
+    result(nil)
+  }
+
+  /// 追加弹幕数据。
+  private func handleAddPictureInPictureDanmakuMethodCall(
+    _ arguments: Any?,
+    _ result: FlutterResult
+  ) {
+    guard let handle = pictureInPictureHandle(arguments, result) else {
+      return
+    }
+    let args = arguments as? [String: Any]
+    let items = (args?["value"] as? [[String: Any]]) ?? []
+    videoOutputManager.addPictureInPictureDanmaku(
+      handle: handle,
+      items: items
+    )
+    result(nil)
+  }
+
+  /// 清空弹幕数据。
+  private func handleClearPictureInPictureDanmakuMethodCall(
+    _ arguments: Any?,
+    _ result: FlutterResult
+  ) {
+    guard let handle = pictureInPictureHandle(arguments, result) else {
+      return
+    }
+    videoOutputManager.clearPictureInPictureDanmaku(handle: handle)
     result(nil)
   }
 

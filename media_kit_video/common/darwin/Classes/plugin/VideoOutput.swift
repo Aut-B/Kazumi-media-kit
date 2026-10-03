@@ -133,6 +133,42 @@ public class VideoOutput: NSObject {
     #endif
   }
 
+  /// 开启 / 关闭画中画弹幕。其它平台为空实现。
+  public func setPictureInPictureDanmakuEnabled(_ value: Bool) {
+    #if os(iOS)
+      worker.enqueue {
+        self.ensurePictureInPicture()?.setDanmakuEnabled(value)
+      }
+    #endif
+  }
+
+  /// 下发画中画弹幕显示参数。其它平台为空实现。
+  public func setPictureInPictureDanmakuConfig(_ config: [String: Any]) {
+    #if os(iOS)
+      worker.enqueue {
+        self.ensurePictureInPicture()?.setDanmakuConfig(config)
+      }
+    #endif
+  }
+
+  /// 追加画中画弹幕数据。其它平台为空实现。
+  public func addPictureInPictureDanmaku(_ items: [[String: Any]]) {
+    #if os(iOS)
+      worker.enqueue {
+        self.ensurePictureInPicture()?.addDanmaku(items)
+      }
+    #endif
+  }
+
+  /// 清空画中画弹幕数据。其它平台为空实现。
+  public func clearPictureInPictureDanmaku() {
+    #if os(iOS)
+      worker.enqueue {
+        self.ensurePictureInPicture()?.clearDanmaku()
+      }
+    #endif
+  }
+
   #if os(iOS)
     /// 懒创建画中画对象，保证 `arm` 与 `start` 共用同一实例。
     private func ensurePictureInPicture() -> PictureInPicture? {

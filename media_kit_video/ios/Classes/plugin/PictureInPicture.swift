@@ -55,6 +55,17 @@ public class PictureInPicture: NSObject {
   /// 画中画控制器（iOS 15+ 才会创建）。
   private var pipController: AVPictureInPictureController?
 
+  /// 画中画小窗的时间轴。
+  ///
+  /// 小窗里的进度条与「前进 / 后退 N 秒」按钮都以画面图层的时间轴为准。若不设置它，
+  /// 系统无从判断当前播放到哪儿，会把进度条画成一条满格长条，并因为「已经到片尾」
+  /// 而把前进按钮置灰。这里挂一个以主机时钟为时间源的 timebase，逐帧按 libmpv
+  /// 的 `time-pos` 校准。
+  private var controlTimebase: CMTimebase?
+
+  /// 画中画弹幕叠加层：把弹幕绘进帧副本，使系统小窗内也能看到弹幕。
+  private let danmaku = DanmakuOverlay()
+
   /// 是否处于「已武装」状态：为 true 时持续把新帧喂给 [displayLayer]。
   /// 由 [start] / [arm] 置位，[stop] / [dispose] 复位。
   public private(set) var isArmed: Bool = false
@@ -188,6 +199,7 @@ public class PictureInPicture: NSObject {
     }
 
     attachDisplayLayer()
+    setupTimebase()
 
     if let controller = pipController {
       return controller
@@ -222,10 +234,22 @@ public class PictureInPicture: NSObject {
       return
     }
 
+    // 当前播放位置：既用于校准小窗进度条，也用于确定这一帧该显示哪些弹幕。
+    let position = mpvPosition()
+    syncTimebase(position)
+
+    // 有弹幕落在画面上时，先绘进帧的副本；否则直接使用原始帧（零额外开销）。
+    var frame = pixelBuffer
+    if danmaku.enabled, danmaku.isActive(at: position),
+      let composed = danmaku.composite(pixelBuffer, at: position)
+    {
+      frame = composed
+    }
+
     var formatDescription: CMVideoFormatDescription?
     let formatStatus = CMVideoFormatDescriptionCreateForImageBuffer(
       allocator: kCFAllocatorDefault,
-      imageBuffer: pixelBuffer,
+      imageBuffer: frame,
       formatDescriptionOut: &formatDescription
     )
     guard formatStatus == noErr, let formatDescription = formatDescription else {
@@ -234,14 +258,17 @@ public class PictureInPicture: NSObject {
 
     var timing = CMSampleTimingInfo(
       duration: .invalid,
-      presentationTimeStamp: .invalid,
+      presentationTimeStamp: CMTime(
+        seconds: position,
+        preferredTimescale: 600
+      ),
       decodeTimeStamp: .invalid
     )
 
     var sampleBuffer: CMSampleBuffer?
     let sampleStatus = CMSampleBufferCreateForImageBuffer(
       allocator: kCFAllocatorDefault,
-      imageBuffer: pixelBuffer,
+      imageBuffer: frame,
       dataReady: true,
       makeDataReadyCallback: nil,
       refcon: nil,
@@ -278,7 +305,103 @@ public class PictureInPicture: NSObject {
     }
   }
 
+  // MARK: - 弹幕
+
+  /// 开启 / 关闭画中画弹幕。关闭后所有帧都按原样送入小窗。
+  public func setDanmakuEnabled(_ value: Bool) {
+    danmaku.enabled = value
+  }
+
+  /// 下发弹幕显示参数（字号缩放、透明度、滚动时长等），与 App 内的弹幕设置保持一致。
+  public func setDanmakuConfig(_ config: [String: Any]) {
+    if let value = config["opacity"] as? NSNumber {
+      danmaku.opacity = CGFloat(max(0, min(1, value.doubleValue)))
+    }
+    if let value = config["fontScale"] as? NSNumber {
+      danmaku.fontScale = CGFloat(max(0.35, min(4, value.doubleValue)))
+    }
+    if let value = config["lineHeight"] as? NSNumber {
+      danmaku.lineHeightScale = CGFloat(max(0.5, min(3, value.doubleValue)))
+    }
+    if let value = config["area"] as? NSNumber {
+      danmaku.area = CGFloat(value.doubleValue)
+    }
+    if let value = config["duration"] as? NSNumber {
+      danmaku.duration = max(1, value.doubleValue)
+    }
+    if let value = config["staticDuration"] as? NSNumber {
+      danmaku.staticDuration = max(0.5, value.doubleValue)
+    }
+    if let value = config["strokeWidth"] as? NSNumber {
+      danmaku.strokeWidth = CGFloat(value.doubleValue)
+    }
+    if let value = config["hideScroll"] as? NSNumber {
+      danmaku.hideScroll = value.boolValue
+    }
+    if let value = config["hideTop"] as? NSNumber {
+      danmaku.hideTop = value.boolValue
+    }
+    if let value = config["hideBottom"] as? NSNumber {
+      danmaku.hideBottom = value.boolValue
+    }
+  }
+
+  /// 追加一批弹幕。同一 `id` 只入库一次，因此拖动进度条后重复下发不会重影。
+  public func addDanmaku(_ items: [[String: Any]]) {
+    danmaku.append(items)
+  }
+
+  public func clearDanmaku() {
+    danmaku.clear()
+  }
+
   // MARK: - 内部
+
+  /// 建立画面图层的时间轴（只做一次）。
+  @available(iOS 15.0, *)
+  private func setupTimebase() {
+    if controlTimebase != nil {
+      return
+    }
+    var timebase: CMTimebase?
+    let status = CMTimebaseCreateWithSourceClock(
+      allocator: kCFAllocatorDefault,
+      sourceClock: CMClockGetHostTimeClock(),
+      timebaseOut: &timebase
+    )
+    guard status == noErr, let timebase = timebase else {
+      NSLog("PictureInPicture: CMTimebaseCreateWithSourceClock failed: \(status)")
+      return
+    }
+    CMTimebaseSetRate(timebase, 1.0)
+    displayLayer.controlTimebase = timebase
+    controlTimebase = timebase
+  }
+
+  /// 把小窗时间轴校准到当前播放位置，并同步播放 / 暂停状态。
+  @available(iOS 15.0, *)
+  private func syncTimebase(_ position: Double) {
+    guard let timebase = controlTimebase else {
+      return
+    }
+    CMTimebaseSetTime(
+      timebase,
+      time: CMTime(seconds: position, preferredTimescale: 600)
+    )
+    let rate: Float = mpvFlag("pause") ? 0 : 1
+    if CMTimebaseGetRate(timebase) != rate {
+      CMTimebaseSetRate(timebase, rate)
+    }
+  }
+
+  /// 当前播放位置（秒）。取不到时返回 0。
+  private func mpvPosition() -> Double {
+    let value = mpvDouble("time-pos")
+    if value.isNaN || value.isInfinite || value < 0 {
+      return 0
+    }
+    return value
+  }
 
   /// 把图层挂进视图层级：置于极小宿主视图内、叠在 Flutter 视图之上。
   ///
@@ -361,11 +484,32 @@ public class PictureInPicture: NSObject {
     mpv_set_property_string(handle, "pause", paused ? "yes" : "no")
   }
 
-  private func seek(by seconds: Double) {
-    guard seconds != 0 else {
+  /// 画中画小窗里的「前进 / 后退 N 秒」。
+  ///
+  /// 按绝对时间跳转并夹在 `[0, duration)` 内，随后立刻校准时间轴，让小窗进度条
+  /// 马上跟到新位置。
+  private func seek(by offset: Double) {
+    guard offset != 0 else {
       return
     }
-    mpv_command_string(handle, "seek \(seconds) relative")
+    let duration = mpvDouble("duration")
+    var target = mpvPosition() + offset
+    if target < 0 {
+      target = 0
+    }
+    if duration > 0, target > duration - 0.5 {
+      target = max(0, duration - 0.5)
+    }
+    mpv_command_string(
+      handle,
+      "seek \(String(format: "%.3f", target)) absolute+exact"
+    )
+    if #available(iOS 15.0, *), let timebase = controlTimebase {
+      CMTimebaseSetTime(
+        timebase,
+        time: CMTime(seconds: target, preferredTimescale: 600)
+      )
+    }
   }
 }
 

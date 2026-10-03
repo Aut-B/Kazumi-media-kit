@@ -68,6 +68,38 @@ abstract class PlatformVideoController {
   /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台恒为 `false`。
   Future<bool> isPictureInPicturePossible() => Future.value(false);
 
+  /// 开启 / 关闭画中画弹幕。
+  ///
+  /// 系统画中画小窗只显示原生画面图层的内容，Flutter 侧绘制的弹幕画布不会被带
+  /// 进去；开启后由原生侧按 [addPictureInPictureDanmaku] 提供的数据自行排版并
+  /// 绘进每一帧，使小窗内也能看到弹幕。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台为空实现。
+  Future<void> setPictureInPictureDanmakuEnabled(bool value) => Future.value();
+
+  /// 下发画中画弹幕的显示参数，与 App 内的弹幕设置保持一致。
+  ///
+  /// 支持的键：`opacity`、`fontScale`、`lineHeight`、`area`、`duration`、
+  /// `staticDuration`、`strokeWidth`、`hideScroll`、`hideTop`、`hideBottom`。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台为空实现。
+  Future<void> setPictureInPictureDanmakuConfig(Map<String, Object> config) =>
+      Future.value();
+
+  /// 追加画中画弹幕数据。
+  ///
+  /// 每一项包含 `id`（用于去重）、`time`（相对视频起点的秒数）、`mode`
+  /// （1/6 滚动、4 底部、5 顶部）、`color`（0xRRGGBB）与 `text`。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台为空实现。
+  Future<void> addPictureInPictureDanmaku(List<Map<String, Object>> items) =>
+      Future.value();
+
+  /// 清空已缓存的画中画弹幕数据（切换视频时调用）。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台为空实现。
+  Future<void> clearPictureInPictureDanmaku() => Future.value();
+
   /// A [Future] that completes when the first video frame has been rendered.
   Future<void> get waitUntilFirstFrameRendered =>
       waitUntilFirstFrameRenderedCompleter.future;

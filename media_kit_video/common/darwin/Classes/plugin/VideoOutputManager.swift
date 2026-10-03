@@ -52,6 +52,37 @@ public class VideoOutputManager: NSObject {
     return self.videoOutputs[handle]?.isPictureInPicturePossible() ?? false
   }
 
+  /// 开启 / 关闭画中画弹幕。
+  public func setPictureInPictureDanmakuEnabled(
+    handle: Int64,
+    value: Bool
+  ) {
+    self.videoOutputs[handle]?.setPictureInPictureDanmakuEnabled(value)
+  }
+
+  /// 下发画中画弹幕显示参数。
+  public func setPictureInPictureDanmakuConfig(
+    handle: Int64,
+    config: [String: Any]
+  ) {
+    self.videoOutputs[handle]?.setPictureInPictureDanmakuConfig(config)
+  }
+
+  /// 追加画中画弹幕数据。
+  public func addPictureInPictureDanmaku(
+    handle: Int64,
+    items: [[String: Any]]
+  ) {
+    self.videoOutputs[handle]?.addPictureInPictureDanmaku(items)
+  }
+
+  /// 清空画中画弹幕数据。
+  public func clearPictureInPictureDanmaku(
+    handle: Int64
+  ) {
+    self.videoOutputs[handle]?.clearPictureInPictureDanmaku()
+  }
+
   public func setSize(
     handle: Int64,
     width: Int64?,

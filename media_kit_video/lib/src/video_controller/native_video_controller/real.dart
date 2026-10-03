@@ -211,6 +211,81 @@ class NativeVideoController extends PlatformVideoController {
     }
   }
 
+  /// 开启 / 关闭画中画弹幕（仅 iOS）。
+  @override
+  Future<void> setPictureInPictureDanmakuEnabled(bool value) async {
+    if (!Platform.isIOS) {
+      return;
+    }
+    try {
+      await _channel.invokeMethod(
+        'VideoOutput.SetPictureInPictureDanmakuEnabled',
+        {'handle': player.handle.toString(), 'value': value},
+      );
+    } catch (exception) {
+      debugPrint(
+        'NativeVideoController: setPictureInPictureDanmakuEnabled: $exception',
+      );
+    }
+  }
+
+  /// 下发画中画弹幕显示参数（仅 iOS）。
+  @override
+  Future<void> setPictureInPictureDanmakuConfig(
+    Map<String, Object> config,
+  ) async {
+    if (!Platform.isIOS) {
+      return;
+    }
+    try {
+      await _channel.invokeMethod(
+        'VideoOutput.SetPictureInPictureDanmakuConfig',
+        {'handle': player.handle.toString(), 'value': config},
+      );
+    } catch (exception) {
+      debugPrint(
+        'NativeVideoController: setPictureInPictureDanmakuConfig: $exception',
+      );
+    }
+  }
+
+  /// 追加画中画弹幕数据（仅 iOS）。
+  @override
+  Future<void> addPictureInPictureDanmaku(
+    List<Map<String, Object>> items,
+  ) async {
+    if (!Platform.isIOS || items.isEmpty) {
+      return;
+    }
+    try {
+      await _channel.invokeMethod('VideoOutput.AddPictureInPictureDanmaku', {
+        'handle': player.handle.toString(),
+        'value': items,
+      });
+    } catch (exception) {
+      debugPrint(
+        'NativeVideoController: addPictureInPictureDanmaku: $exception',
+      );
+    }
+  }
+
+  /// 清空画中画弹幕数据（仅 iOS）。
+  @override
+  Future<void> clearPictureInPictureDanmaku() async {
+    if (!Platform.isIOS) {
+      return;
+    }
+    try {
+      await _channel.invokeMethod('VideoOutput.ClearPictureInPictureDanmaku', {
+        'handle': player.handle.toString(),
+      });
+    } catch (exception) {
+      debugPrint(
+        'NativeVideoController: clearPictureInPictureDanmaku: $exception',
+      );
+    }
+  }
+
   /// Disposes the instance. Releases allocated resources back to the system.
   Future<void> _dispose() {
     final handle = player.handle;
