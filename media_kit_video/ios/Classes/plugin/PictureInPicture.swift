@@ -239,8 +239,10 @@ public class PictureInPicture: NSObject {
     syncTimebase(position)
 
     // 有弹幕落在画面上时，先绘进帧的副本；否则直接使用原始帧（零额外开销）。
+    // 只有小窗真的显示出来了才绘制——仅仅「武装」了自动画中画时不应白白耗电。
     var frame = pixelBuffer
-    if danmaku.enabled, danmaku.isActive(at: position),
+    if pipController?.isPictureInPictureActive ?? false, danmaku.enabled,
+      danmaku.isActive(at: position),
       let composed = danmaku.composite(pixelBuffer, at: position)
     {
       frame = composed
