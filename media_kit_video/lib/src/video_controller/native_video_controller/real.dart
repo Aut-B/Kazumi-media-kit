@@ -175,6 +175,42 @@ class NativeVideoController extends PlatformVideoController {
     }
   }
 
+  /// 「武装」自动画中画（仅 iOS）：不立即弹出窗口，而是在用户划回主屏幕
+  /// （App 进入后台）时由系统自动进入画中画。
+  @override
+  Future<void> setAutoEnterPictureInPicture(bool value) async {
+    if (!Platform.isIOS) {
+      return;
+    }
+    try {
+      await _channel.invokeMethod('VideoOutput.SetAutoEnterPictureInPicture', {
+        'handle': player.handle.toString(),
+        'value': value,
+      });
+    } catch (exception) {
+      debugPrint(
+        'NativeVideoController: setAutoEnterPictureInPicture: $exception',
+      );
+    }
+  }
+
+  /// 当前是否具备进入画中画的条件（仅 iOS）。
+  @override
+  Future<bool> isPictureInPicturePossible() async {
+    if (!Platform.isIOS) {
+      return false;
+    }
+    try {
+      return await _channel.invokeMethod<bool>(
+            'VideoOutput.IsPictureInPicturePossible',
+            {'handle': player.handle.toString()},
+          ) ??
+          false;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// Disposes the instance. Releases allocated resources back to the system.
   Future<void> _dispose() {
     final handle = player.handle;
@@ -230,6 +266,13 @@ class NativeVideoController extends PlatformVideoController {
               case 'VideoOutput.PictureInPictureRestoreUI':
                 {
                   PictureInPicture.emit('restore');
+                  break;
+                }
+              case 'VideoOutput.PictureInPictureError':
+                {
+                  final String message =
+                      (args['message'] as String?) ?? '画中画不可用';
+                  PictureInPicture.emitError(message);
                   break;
                 }
               default:

@@ -59,6 +59,10 @@ public class MediaKitVideoPlugin: NSObject, FlutterPlugin {
       handleDisposeMethodCall(call.arguments, result)
     case "VideoOutput.SetPictureInPicture":
       handleSetPictureInPictureMethodCall(call.arguments, result)
+    case "VideoOutput.SetAutoEnterPictureInPicture":
+      handleSetAutoEnterPictureInPictureMethodCall(call.arguments, result)
+    case "VideoOutput.IsPictureInPicturePossible":
+      handleIsPictureInPicturePossibleMethodCall(call.arguments, result)
     case "VideoOutput.IsPictureInPictureSupported":
       result(VideoOutput.isPictureInPictureSupported)
     case "Utils.EnterNativeFullscreen":
@@ -174,6 +178,49 @@ public class MediaKitVideoPlugin: NSObject, FlutterPlugin {
     let value = (args?["value"] as? Bool) ?? false
     videoOutputManager.setPictureInPicture(handle: handle, value: value)
     result(nil)
+  }
+
+  /// 「武装」自动画中画：App 进入后台时由系统自动进入画中画。
+  private func handleSetAutoEnterPictureInPictureMethodCall(
+    _ arguments: Any?,
+    _ result: FlutterResult
+  ) {
+    let args = arguments as? [String: Any]
+    guard let handleStr = args?["handle"] as? String,
+      let handle = Int64(handleStr)
+    else {
+      result(
+        FlutterError(
+          code: "invalid_args",
+          message: "handle must be an Int64",
+          details: nil
+        )
+      )
+      return
+    }
+
+    let value = (args?["value"] as? Bool) ?? false
+    videoOutputManager.setAutoEnterPictureInPicture(
+      handle: handle,
+      value: value
+    )
+    result(nil)
+  }
+
+  /// 当前是否具备进入画中画的条件。
+  private func handleIsPictureInPicturePossibleMethodCall(
+    _ arguments: Any?,
+    _ result: FlutterResult
+  ) {
+    let args = arguments as? [String: Any]
+    guard let handleStr = args?["handle"] as? String,
+      let handle = Int64(handleStr)
+    else {
+      result(false)
+      return
+    }
+
+    result(videoOutputManager.isPictureInPicturePossible(handle: handle))
   }
 
   private func handleEnterNativeFullscreenMethodCall(

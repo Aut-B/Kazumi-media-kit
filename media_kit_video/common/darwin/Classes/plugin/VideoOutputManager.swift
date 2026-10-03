@@ -37,6 +37,21 @@ public class VideoOutputManager: NSObject {
     self.videoOutputs[handle]?.setPictureInPicture(value)
   }
 
+  /// 「武装」自动画中画：App 进入后台时由系统自动进入画中画。
+  public func setAutoEnterPictureInPicture(
+    handle: Int64,
+    value: Bool
+  ) {
+    self.videoOutputs[handle]?.setAutoEnterPictureInPicture(value)
+  }
+
+  /// 当前是否具备进入画中画的条件。
+  public func isPictureInPicturePossible(
+    handle: Int64
+  ) -> Bool {
+    return self.videoOutputs[handle]?.isPictureInPicturePossible() ?? false
+  }
+
   public func setSize(
     handle: Int64,
     width: Int64?,

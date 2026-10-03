@@ -57,6 +57,17 @@ abstract class PlatformVideoController {
   /// 进入 / 退出结果可通过 `PictureInPicture.events` 监听。
   Future<void> setPictureInPicture(bool value) => Future.value();
 
+  /// 「武装」自动画中画：不立即弹出画中画窗口，而是在用户划回主屏幕
+  /// （App 进入后台）时由系统自动进入画中画。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台为空实现。
+  Future<void> setAutoEnterPictureInPicture(bool value) => Future.value();
+
+  /// 当前是否具备进入画中画的条件（图层已就绪、已渲染首帧等）。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台恒为 `false`。
+  Future<bool> isPictureInPicturePossible() => Future.value(false);
+
   /// A [Future] that completes when the first video frame has been rendered.
   Future<void> get waitUntilFirstFrameRendered =>
       waitUntilFirstFrameRenderedCompleter.future;

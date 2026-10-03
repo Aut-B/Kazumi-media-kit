@@ -97,19 +97,14 @@ public class VideoOutput: NSObject {
     #if os(iOS)
       worker.enqueue {
         if value {
-          if self.pip == nil {
-            self.pip = PictureInPicture(
-              handle: self.handle,
-              eventCallback: self.pipEventCallback
-            )
-          }
-          self.pip?.start()
+          let pip = self.ensurePictureInPicture()
+          pip?.start()
           // 若当前处于暂停状态，mpv 不会继续渲染新帧；这里手动补一帧，
           // 避免画中画窗口一片空白。
           if let pixelBuffer = self.texture?.copyPixelBuffer()?
             .takeRetainedValue()
           {
-            self.pip?.enqueue(pixelBuffer)
+            pip?.enqueue(pixelBuffer)
           }
         } else {
           self.pip?.stop()
@@ -117,6 +112,41 @@ public class VideoOutput: NSObject {
       }
     #endif
   }
+
+  /// 「武装」自动画中画：不立即弹出窗口，而是在 App 进入后台（用户划回主屏幕）时
+  /// 由系统自动进入画中画。`value` 为 `false` 时关闭该行为。
+  public func setAutoEnterPictureInPicture(_ value: Bool) {
+    #if os(iOS)
+      worker.enqueue {
+        let pip = self.ensurePictureInPicture()
+        pip?.arm(autoEnter: value)
+      }
+    #endif
+  }
+
+  /// 当前是否具备进入画中画的条件。
+  public func isPictureInPicturePossible() -> Bool {
+    #if os(iOS)
+      return self.pip?.isPossible ?? false
+    #else
+      return false
+    #endif
+  }
+
+  #if os(iOS)
+    /// 懒创建画中画对象，保证 `arm` 与 `start` 共用同一实例。
+    private func ensurePictureInPicture() -> PictureInPicture? {
+      if let pip = self.pip {
+        return pip
+      }
+      let pip = PictureInPicture(
+        handle: self.handle,
+        eventCallback: self.pipEventCallback
+      )
+      self.pip = pip
+      return pip
+    }
+  #endif
 
   /// 当前设备 / 系统是否支持系统级画中画。
   public static var isPictureInPictureSupported: Bool {
@@ -239,7 +269,7 @@ public class VideoOutput: NSObject {
   #if os(iOS)
     /// 把最新渲染完成的一帧喂给画中画图层。
     private func feedPictureInPicture() {
-      guard let pip = pip, pip.isRunning else {
+      guard let pip = pip, pip.isArmed else {
         return
       }
       guard let pixelBuffer = texture?.copyPixelBuffer()?.takeRetainedValue()

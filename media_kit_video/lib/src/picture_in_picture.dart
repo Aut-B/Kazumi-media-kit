@@ -45,6 +45,22 @@ class PictureInPicture {
     }
   }
 
+  static final StreamController<String> _errors =
+      StreamController<String>.broadcast();
+
+  /// 画中画错误流。内容为可直接展示给用户的失败原因，
+  /// 例如「当前设备不支持画中画」「启动画中画失败：…」。
+  static Stream<String> get errors {
+    return _errors.stream;
+  }
+
+  /// 由原生侧调用，向 [errors] 推送错误信息。
+  static void emitError(String message) {
+    if (!_errors.isClosed) {
+      _errors.add(message);
+    }
+  }
+
   /// 当前设备 / 系统是否支持系统级画中画（iOS 15+）。
   static Future<bool> isSupported() async {
     try {
