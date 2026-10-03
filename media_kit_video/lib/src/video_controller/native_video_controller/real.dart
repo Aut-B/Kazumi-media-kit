@@ -12,6 +12,7 @@ import 'package:synchronized/synchronized.dart';
 
 import 'package:media_kit/media_kit.dart';
 
+import 'package:media_kit_video/src/picture_in_picture.dart';
 import 'package:media_kit_video/src/utils/query_decoders.dart';
 import 'package:media_kit_video/src/video_controller/platform_video_controller.dart';
 
@@ -237,6 +238,196 @@ class NativeVideoController extends PlatformVideoController {
     }
   }
 
+  /// 当前平台 / 设备是否支持系统级画中画（仅 iOS）。
+  @override
+  Future<bool> isPictureInPictureSupported() async {
+    if (!Platform.isIOS) {
+      return false;
+    }
+    try {
+      return await _channel.invokeMethod<bool>(
+            'VideoOutput.IsPictureInPictureSupported',
+          ) ??
+          false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 进入 / 退出系统级画中画（仅 iOS）。
+  ///
+  /// 播放 / 暂停 / 快进在原生侧直接操作 libmpv，media_kit 会通过属性观察自动
+  /// 同步 Dart 状态；进入 / 退出结果通过 `PictureInPicture.events` 通知。
+  @override
+  Future<void> setPictureInPicture(bool value) async {
+    if (!Platform.isIOS) {
+      return;
+    }
+    final handle = await player.handle;
+    try {
+      await _channel.invokeMethod('VideoOutput.SetPictureInPicture', {
+        'handle': handle.toString(),
+        'value': value,
+      });
+    } catch (exception) {
+      debugPrint('NativeVideoController: setPictureInPicture: $exception');
+    }
+  }
+
+  /// 「武装」自动画中画（仅 iOS）：不立即弹出窗口，而是在用户划回主屏幕
+  /// （App 进入后台）时由系统自动进入画中画。
+  @override
+  Future<void> setAutoEnterPictureInPicture(bool value) async {
+    if (!Platform.isIOS) {
+      return;
+    }
+    final handle = await player.handle;
+    try {
+      await _channel.invokeMethod('VideoOutput.SetAutoEnterPictureInPicture', {
+        'handle': handle.toString(),
+        'value': value,
+      });
+    } catch (exception) {
+      debugPrint(
+        'NativeVideoController: setAutoEnterPictureInPicture: $exception',
+      );
+    }
+  }
+
+  /// 当前是否具备进入画中画的条件（仅 iOS）。
+  @override
+  Future<bool> isPictureInPicturePossible() async {
+    if (!Platform.isIOS) {
+      return false;
+    }
+    final handle = await player.handle;
+    try {
+      return await _channel.invokeMethod<bool>(
+            'VideoOutput.IsPictureInPicturePossible',
+            {'handle': handle.toString()},
+          ) ??
+          false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// 画中画诊断快照（仅 iOS）。
+  @override
+  Future<Map<String, Object?>> pictureInPictureDiagnostics() async {
+    if (!Platform.isIOS) {
+      return const {};
+    }
+    final handle = await player.handle;
+    try {
+      final value = await _channel.invokeMapMethod<String, Object?>(
+        'VideoOutput.PictureInPictureDiagnostics',
+        {'handle': handle.toString()},
+      );
+      return value ?? const {};
+    } catch (_) {
+      return const {};
+    }
+  }
+
+  /// 开启 / 关闭画中画弹幕（仅 iOS）。
+  @override
+  Future<void> setPictureInPictureDanmakuEnabled(bool value) async {
+    if (!Platform.isIOS) {
+      return;
+    }
+    final handle = await player.handle;
+    try {
+      await _channel.invokeMethod(
+        'VideoOutput.SetPictureInPictureDanmakuEnabled',
+        {'handle': handle.toString(), 'value': value},
+      );
+    } catch (exception) {
+      debugPrint(
+        'NativeVideoController: setPictureInPictureDanmakuEnabled: $exception',
+      );
+    }
+  }
+
+  /// 下发画中画弹幕显示参数（仅 iOS）。
+  @override
+  Future<void> setPictureInPictureDanmakuConfig(
+    Map<String, Object> config,
+  ) async {
+    if (!Platform.isIOS) {
+      return;
+    }
+    final handle = await player.handle;
+    try {
+      await _channel.invokeMethod(
+        'VideoOutput.SetPictureInPictureDanmakuConfig',
+        {'handle': handle.toString(), 'value': config},
+      );
+    } catch (exception) {
+      debugPrint(
+        'NativeVideoController: setPictureInPictureDanmakuConfig: $exception',
+      );
+    }
+  }
+
+  /// 追加画中画弹幕数据（仅 iOS）。
+  @override
+  Future<void> addPictureInPictureDanmaku(
+    List<Map<String, Object>> items,
+  ) async {
+    if (!Platform.isIOS || items.isEmpty) {
+      return;
+    }
+    final handle = await player.handle;
+    try {
+      await _channel.invokeMethod('VideoOutput.AddPictureInPictureDanmaku', {
+        'handle': handle.toString(),
+        'value': items,
+      });
+    } catch (exception) {
+      debugPrint(
+        'NativeVideoController: addPictureInPictureDanmaku: $exception',
+      );
+    }
+  }
+
+  /// 清空画中画弹幕数据（仅 iOS）。
+  @override
+  Future<void> clearPictureInPictureDanmaku() async {
+    if (!Platform.isIOS) {
+      return;
+    }
+    final handle = await player.handle;
+    try {
+      await _channel.invokeMethod('VideoOutput.ClearPictureInPictureDanmaku', {
+        'handle': handle.toString(),
+      });
+    } catch (exception) {
+      debugPrint(
+        'NativeVideoController: clearPictureInPictureDanmaku: $exception',
+      );
+    }
+  }
+
+  /// 为「换了视频源」做准备（仅 iOS）。
+  @override
+  Future<void> preparePictureInPictureForNewMedia() async {
+    if (!Platform.isIOS) {
+      return;
+    }
+    final handle = await player.handle;
+    try {
+      await _channel.invokeMethod(
+        'VideoOutput.PreparePictureInPictureForNewMedia',
+        {'handle': handle.toString()},
+      );
+    } catch (exception) {
+      debugPrint(
+        'NativeVideoController: preparePictureInPictureForNewMedia: $exception',
+      );
+    }
+  }
+
   /// Disposes the instance. Releases allocated resources back to the system.
   Future<void> _dispose() async {
     super.dispose();
@@ -285,6 +476,25 @@ class NativeVideoController extends PlatformVideoController {
                         completer?.complete();
                       }
                     }
+                    break;
+                  }
+                case 'VideoOutput.PictureInPictureStateChanged':
+                  {
+                    final bool active =
+                        (call.arguments['active'] as bool?) ?? false;
+                    PictureInPicture.emit(active ? 'start' : 'stop');
+                    break;
+                  }
+                case 'VideoOutput.PictureInPictureRestoreUI':
+                  {
+                    PictureInPicture.emit('restore');
+                    break;
+                  }
+                case 'VideoOutput.PictureInPictureError':
+                  {
+                    final String message =
+                        (call.arguments['message'] as String?) ?? '画中画不可用';
+                    PictureInPicture.emitError(message);
                     break;
                   }
                 default:

@@ -34,6 +34,8 @@ typedef struct {
     void (*free_node_contents)(mpv_node *);
     int (*get_property)(mpv_handle *, const char *, mpv_format, void *);
     int (*set_option_string)(mpv_handle *, const char *, const char *);
+    int (*set_property_string)(mpv_handle *, const char *, const char *);
+    int (*command_string)(mpv_handle *, const char *);
     int (*render_context_create)(mpv_render_context **, mpv_handle *, mpv_render_param *);
     void (*render_context_free)(mpv_render_context *);
     int (*render_context_render)(mpv_render_context *, mpv_render_param *);
@@ -65,6 +67,8 @@ int media_kit_mpv_initialize(const char *path) {
     LOAD(free_node_contents);
     LOAD(get_property);
     LOAD(set_option_string);
+    LOAD(set_property_string);
+    LOAD(command_string);
     LOAD(render_context_create);
     LOAD(render_context_free);
     LOAD(render_context_render);
@@ -81,6 +85,8 @@ const char *media_kit_mpv_error_string(int error) { return api.error_string(erro
 void media_kit_mpv_free_node_contents(mpv_node *node) { api.free_node_contents(node); }
 int media_kit_mpv_get_property(mpv_handle *h, const char *n, mpv_format f, void *d) { return api.get_property(h, n, f, d); }
 int media_kit_mpv_set_option_string(mpv_handle *h, const char *n, const char *v) { return api.set_option_string(h, n, v); }
+int media_kit_mpv_set_property_string(mpv_handle *h, const char *n, const char *v) { return api.set_property_string(h, n, v); }
+int media_kit_mpv_command_string(mpv_handle *h, const char *a) { return api.command_string(h, a); }
 int media_kit_mpv_render_context_create(mpv_render_context **c, mpv_handle *h, mpv_render_param *p) { return api.render_context_create(c, h, p); }
 void media_kit_mpv_render_context_free(mpv_render_context *c) { api.render_context_free(c); }
 int media_kit_mpv_render_context_render(mpv_render_context *c, mpv_render_param *p) { return api.render_context_render(c, p); }

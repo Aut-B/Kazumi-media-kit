@@ -13,6 +13,8 @@ const char *media_kit_mpv_error_string(int error);
 void media_kit_mpv_free_node_contents(mpv_node *node);
 int media_kit_mpv_get_property(mpv_handle *handle, const char *name, mpv_format format, void *data);
 int media_kit_mpv_set_option_string(mpv_handle *handle, const char *name, const char *value);
+int media_kit_mpv_set_property_string(mpv_handle *handle, const char *name, const char *value);
+int media_kit_mpv_command_string(mpv_handle *handle, const char *args);
 int media_kit_mpv_render_context_create(mpv_render_context **context, mpv_handle *handle, mpv_render_param *params);
 void media_kit_mpv_render_context_free(mpv_render_context *context);
 int media_kit_mpv_render_context_render(mpv_render_context *context, mpv_render_param *params);

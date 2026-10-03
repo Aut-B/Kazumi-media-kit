@@ -51,6 +51,79 @@ abstract class PlatformVideoController {
     int? height,
   });
 
+  /// 当前平台 / 设备是否支持系统级画中画。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台恒为 `false`。
+  Future<bool> isPictureInPictureSupported() => Future.value(false);
+
+  /// 进入 / 退出系统级画中画。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台为空实现。
+  /// 进入 / 退出结果可通过 `PictureInPicture.events` 监听。
+  Future<void> setPictureInPicture(bool value) => Future.value();
+
+  /// 「武装」自动画中画：不立即弹出画中画窗口，而是在用户划回主屏幕
+  /// （App 进入后台）时由系统自动进入画中画。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台为空实现。
+  Future<void> setAutoEnterPictureInPicture(bool value) => Future.value();
+
+  /// 当前是否具备进入画中画的条件（图层已就绪、已渲染首帧等）。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台恒为 `false`。
+  Future<bool> isPictureInPicturePossible() => Future.value(false);
+
+  /// 画中画诊断快照，用于判断「小窗黑屏」断在哪一环。
+  ///
+  /// 常见字段：`attempt`（渲染回调出帧次数）、`enqueued`（真正交给图层的帧数）、
+  /// `notReady`（图层拒收次数）、`layerStatus`（`rendering` / `failed` /
+  /// `unknown`）、`layerReady`、`showing`（小窗是否已显示）。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台返回空表。
+  Future<Map<String, Object?>> pictureInPictureDiagnostics() =>
+      Future.value(const {});
+
+  /// 开启 / 关闭画中画弹幕。
+  ///
+  /// 系统画中画小窗只显示原生画面图层的内容，Flutter 侧绘制的弹幕画布不会被带
+  /// 进去；开启后由原生侧按 [addPictureInPictureDanmaku] 提供的数据自行排版并
+  /// 绘进每一帧，使小窗内也能看到弹幕。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台为空实现。
+  Future<void> setPictureInPictureDanmakuEnabled(bool value) => Future.value();
+
+  /// 下发画中画弹幕的显示参数，与 App 内的弹幕设置保持一致。
+  ///
+  /// 支持的键：`opacity`、`fontScale`、`lineHeight`、`area`、`duration`、
+  /// `staticDuration`、`strokeWidth`、`hideScroll`、`hideTop`、`hideBottom`。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台为空实现。
+  Future<void> setPictureInPictureDanmakuConfig(Map<String, Object> config) =>
+      Future.value();
+
+  /// 追加画中画弹幕数据。
+  ///
+  /// 每一项包含 `id`（用于去重）、`time`（相对视频起点的秒数）、`mode`
+  /// （1/6 滚动、4 底部、5 顶部）、`color`（0xRRGGBB）与 `text`。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台为空实现。
+  Future<void> addPictureInPictureDanmaku(List<Map<String, Object>> items) =>
+      Future.value();
+
+  /// 清空已缓存的画中画弹幕数据（切换视频时调用）。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台为空实现。
+  Future<void> clearPictureInPictureDanmaku() => Future.value();
+
+  /// 为「换了视频源」做准备（连播下一集、换源、切清晰度等）。
+  ///
+  /// 保持画中画控制器与画面源不动，只清掉上一集的残留——图层内容、时间轴与弹幕。
+  /// 新视频的播放位置从 0 开始，若不清空，时间轴倒退会让画面图层停止刷新，
+  /// 表现为「App 内画面正常、系统小窗一直黑屏」。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台为空实现。
+  Future<void> preparePictureInPictureForNewMedia() => Future.value();
+
   /// A [Future] that completes when the first video frame has been rendered.
   Future<void> get waitUntilFirstFrameRendered =>
       waitUntilFirstFrameRenderedCompleter.future;
