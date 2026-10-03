@@ -3,10 +3,6 @@ import AVKit
 import CoreMedia
 import UIKit
 
-#if SWIFT_PACKAGE
-  import Mpv
-#endif
-
 /// 系统级画中画（Picture-in-Picture）。
 ///
 /// media_kit 在 iOS 上把 libmpv 的画面通过 OpenGL ES 渲染进一块
@@ -832,23 +828,15 @@ public class PictureInPicture: NSObject {
   // MARK: - libmpv 读写
 
   private func mpvFlag(_ name: String) -> Bool {
-    var value: Int32 = 0
-    if media_kit_mpv_get_property(handle, name, MPV_FORMAT_FLAG, &value) < 0 {
-      return false
-    }
-    return value != 0
+    return MPVHelpers.getFlag(handle, name)
   }
 
   private func mpvDouble(_ name: String) -> Double {
-    var value: Double = 0
-    if media_kit_mpv_get_property(handle, name, MPV_FORMAT_DOUBLE, &value) < 0 {
-      return 0
-    }
-    return value
+    return MPVHelpers.getDouble(handle, name)
   }
 
   private func setPaused(_ paused: Bool) {
-    media_kit_mpv_set_property_string(handle, "pause", paused ? "yes" : "no")
+    MPVHelpers.setString(handle, "pause", paused ? "yes" : "no")
   }
 
   /// 画中画小窗里的「前进 / 后退 N 秒」。
@@ -867,7 +855,7 @@ public class PictureInPicture: NSObject {
     if duration > 0, target > duration - 0.5 {
       target = max(0, duration - 0.5)
     }
-    media_kit_mpv_command_string(
+    MPVHelpers.command(
       handle,
       "seek \(String(format: "%.3f", target)) absolute+exact"
     )
