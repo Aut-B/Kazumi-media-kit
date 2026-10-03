@@ -151,6 +151,18 @@ public class VideoOutput: NSObject {
     #endif
   }
 
+  /// 开启 / 关闭画中画「画面内诊断叠加层」：读数会直接画进小窗里的画面。
+  ///
+  /// 系统小窗只显示画面图层的内容，因此小窗里能不能看到这些读数，直接等于「画面帧
+  /// 有没有送到图层」。排障用，正常播放时关闭。其它平台为空实现。
+  public func setPictureInPictureDebugOverlay(_ value: Bool) {
+    #if os(iOS)
+      worker.enqueue {
+        self.ensurePictureInPicture()?.setDebugOverlayEnabled(value)
+      }
+    #endif
+  }
+
   /// 下发画中画弹幕显示参数。其它平台为空实现。
   public func setPictureInPictureDanmakuConfig(_ config: [String: Any]) {
     #if os(iOS)

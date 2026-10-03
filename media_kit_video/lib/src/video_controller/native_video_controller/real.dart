@@ -228,6 +228,24 @@ class NativeVideoController extends PlatformVideoController {
     }
   }
 
+  /// 开启 / 关闭画中画「画面内诊断叠加层」（仅 iOS）。
+  @override
+  Future<void> setPictureInPictureDebugOverlay(bool value) async {
+    if (!Platform.isIOS) {
+      return;
+    }
+    try {
+      await _channel.invokeMethod(
+        'VideoOutput.SetPictureInPictureDebugOverlay',
+        {'handle': player.handle.toString(), 'value': value},
+      );
+    } catch (exception) {
+      debugPrint(
+        'NativeVideoController: setPictureInPictureDebugOverlay: $exception',
+      );
+    }
+  }
+
   /// 开启 / 关闭画中画弹幕（仅 iOS）。
   @override
   Future<void> setPictureInPictureDanmakuEnabled(bool value) async {

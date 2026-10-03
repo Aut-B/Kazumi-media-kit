@@ -67,6 +67,8 @@ public class MediaKitVideoPlugin: NSObject, FlutterPlugin {
       handlePictureInPictureDiagnosticsMethodCall(call.arguments, result)
     case "VideoOutput.IsPictureInPictureSupported":
       result(VideoOutput.isPictureInPictureSupported)
+    case "VideoOutput.SetPictureInPictureDebugOverlay":
+      handleSetPictureInPictureDebugOverlayMethodCall(call.arguments, result)
     case "VideoOutput.SetPictureInPictureDanmakuEnabled":
       handleSetPictureInPictureDanmakuEnabledMethodCall(call.arguments, result)
     case "VideoOutput.SetPictureInPictureDanmakuConfig":
@@ -199,6 +201,23 @@ public class MediaKitVideoPlugin: NSObject, FlutterPlugin {
       return
     }
     result(videoOutputManager.pictureInPictureDiagnostics(handle: handle))
+  }
+
+  /// 画中画「画面内诊断叠加层」开关。
+  private func handleSetPictureInPictureDebugOverlayMethodCall(
+    _ arguments: Any?,
+    _ result: FlutterResult
+  ) {
+    guard let handle = pictureInPictureHandle(arguments, result) else {
+      return
+    }
+    let args = arguments as? [String: Any]
+    let value = (args?["value"] as? Bool) ?? false
+    videoOutputManager.setPictureInPictureDebugOverlay(
+      handle: handle,
+      value: value
+    )
+    result(nil)
   }
 
   /// 画中画弹幕开关。

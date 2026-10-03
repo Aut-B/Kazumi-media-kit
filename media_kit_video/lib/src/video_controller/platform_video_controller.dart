@@ -78,6 +78,15 @@ abstract class PlatformVideoController {
   Future<Map<String, Object?>> pictureInPictureDiagnostics() =>
       Future.value(const {});
 
+  /// 开启 / 关闭画中画「画面内诊断叠加层」。
+  ///
+  /// 开启后，原生侧会把画中画链路的读数直接绘进送入小窗的画面帧里。系统小窗只显
+  /// 示画面图层的内容，因此「小窗里能不能看到这些读数」就等于「画面帧到底有没有
+  /// 送到图层」，可直接用肉眼把黑屏成因切成两类。仅排障时开启。
+  ///
+  /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台为空实现。
+  Future<void> setPictureInPictureDebugOverlay(bool value) => Future.value();
+
   /// 开启 / 关闭画中画弹幕。
   ///
   /// 系统画中画小窗只显示原生画面图层的内容，Flutter 侧绘制的弹幕画布不会被带

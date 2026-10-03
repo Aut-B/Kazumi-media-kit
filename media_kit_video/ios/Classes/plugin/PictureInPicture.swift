@@ -66,6 +66,9 @@ public class PictureInPicture: NSObject {
   /// 画中画弹幕叠加层：把弹幕绘进帧副本，使系统小窗内也能看到弹幕。
   private let danmaku = DanmakuOverlay()
 
+  /// 画面内诊断叠加层：把读数绘进帧副本，使「小窗是否收到了画面」可直接用肉眼判断。
+  private let debugOverlay = PictureInPictureDebugOverlay()
+
   /// 是否处于「已武装」状态：为 true 时向 [displayLayer] 提供画面帧。
   ///
   /// 由 [start] / [arm] 置位，只有 [disarm] / [dispose] 才会复位——**关闭小窗
@@ -148,6 +151,24 @@ public class PictureInPicture: NSObject {
   /// 保活定时器实际触发次数。
   private var statTimerTicks = 0
 
+  /// 播放类音频会话当前是否处于活跃状态。
+  ///
+  /// 画中画要求 App 持有活跃的播放类会话；后台态下激活可能失败，而系统此时可能
+  /// 只给出一个「有框无画面」的小窗。纳入诊断，便于把这第二种成因与图层问题区分开。
+  private var audioSessionActive = false
+
+  /// 因图层「需要先清空队列才能恢复解码」而主动 flush 的次数。
+  private var statResumeFlush = 0
+
+  /// 最近一次「恢复冲洗」的时刻，用于限制冲洗频率。
+  private var lastResumeFlush: CFTimeInterval = 0
+
+  /// 由主线程维护的「系统是否认为可以画中画」缓存。
+  ///
+  /// 渲染线程要把它画进诊断叠加层，而 `AVPictureInPictureController` 的属性只能在
+  /// 主线程访问，故在这里存一份快照。
+  private var possibleCache = false
+
   init(handle: OpaquePointer, eventCallback: @escaping EventCallback) {
     self.handle = handle
     self.eventCallback = eventCallback
@@ -221,6 +242,7 @@ public class PictureInPicture: NSObject {
     guard let controller = _ensureController() else {
       return
     }
+    possibleCache = controller.isPictureInPicturePossible
     if controller.isPictureInPictureActive {
       startDeadline = 0
       return
@@ -475,6 +497,14 @@ public class PictureInPicture: NSObject {
     {
       frame = composed
     }
+    // 诊断叠加层：开机时把读数自身画进小窗。小窗里看得到这些字，就说明帧确实送到了
+    // 图层，黑屏发生在「系统把图层内容接进小窗」那一环；一片纯黑连字也没有，则说明
+    // 帧压根没送进去。这是零成本区分两类成因的办法（仅诊断时开启）。
+    if debugOverlay.enabled,
+      let composed = debugOverlay.composite(frame, lines: debugLines(frame))
+    {
+      frame = composed
+    }
 
     var formatDescription: CMVideoFormatDescription?
     let formatStatus = CMVideoFormatDescriptionCreateForImageBuffer(
@@ -528,8 +558,25 @@ public class PictureInPicture: NSObject {
     }
 
     statEnqueued += 1
-    DispatchQueue.main.async {
-      if layer.status == .failed || (force && !layer.isReadyForMoreMediaData) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else {
+        return
+      }
+      // 后台态（例如 App 被另一个进程托管、自己始终处于后台）下，图层可能进入
+      // 「需要先清空队列才能恢复解码」的状态。此时若直接入队，样本会被图层静默地
+      // 丢掉 —— 现象恰好是「入队数一直涨、小窗始终黑」。此处按官方文档给出的做法
+      // 先 flush 再入队；两者都投在同一条主队列上，先后顺序有保证。
+      let now = CACurrentMediaTime()
+      let resumeFlush =
+        layer.requiresFlushToResumeDecoding && now - self.lastResumeFlush > 0.2
+      if layer.status == .failed
+        || resumeFlush
+        || (force && !layer.isReadyForMoreMediaData)
+      {
+        if resumeFlush {
+          self.statResumeFlush += 1
+        }
+        self.lastResumeFlush = now
         layer.flush()
       }
       layer.enqueue(sampleBuffer)
@@ -541,6 +588,11 @@ public class PictureInPicture: NSObject {
   /// 开启 / 关闭画中画弹幕。关闭后所有帧都按原样送入小窗。
   public func setDanmakuEnabled(_ value: Bool) {
     danmaku.enabled = value
+  }
+
+  /// 开启 / 关闭「画面内诊断叠加层」（排障用，读数会直接画进小窗）。
+  public func setDebugOverlayEnabled(_ value: Bool) {
+    debugOverlay.enabled = value
   }
 
   /// 下发弹幕显示参数（字号缩放、透明度、滚动时长等），与 App 内的弹幕设置保持一致。
@@ -597,8 +649,25 @@ public class PictureInPicture: NSObject {
     statThrottled = 0
     statCopyNil = 0
     statTimerTicks = 0
+    statResumeFlush = 0
     notReadySince = 0
     lastStuckFlush = 0
+    lastResumeFlush = 0
+  }
+
+  /// 供画面内诊断叠加层显示的一行行读数。
+  ///
+  /// 在渲染线程上调用，因此只读线程安全的缓存值与计数，不去碰
+  /// `AVPictureInPictureController` 的属性（那些只能在主线程访问）。
+  private func debugLines(_ frame: CVPixelBuffer) -> [String] {
+    let layer = displayLayer
+    let size = "\(CVPixelBufferGetWidth(frame))x\(CVPixelBufferGetHeight(frame))"
+    return [
+      "帧入图层 \(statEnqueued)/\(statAttempt)",
+      "拒收 \(statNotReady) · 恢复冲洗 \(statResumeFlush) · 就绪 \(layer.isReadyForMoreMediaData ? 1 : 0)",
+      "小窗 \(isShowing ? 1 : 0) · 武装 \(isArmed ? 1 : 0) · 可画 \(possibleCache ? 1 : 0) · 声 \(audioSessionActive ? 1 : 0)",
+      "保活 \(statTimerTicks) · \(size)",
+    ]
   }
 
   /// 图层当前状态的文字描述（用于日志与诊断）。
@@ -631,6 +700,7 @@ public class PictureInPicture: NSObject {
   /// （内部会读取 `AVPictureInPictureController` 与图层的状态）。
   public func diagnostics() -> [String: Any] {
     let layer = displayLayer
+    possibleCache = pipController?.isPictureInPicturePossible ?? false
     var rate: Double = -1
     if #available(iOS 15.0, *), let timebase = controlTimebase {
       rate = CMTimebaseGetRate(timebase)
@@ -654,6 +724,7 @@ public class PictureInPicture: NSObject {
       "throttled": statThrottled,
       "copyNil": statCopyNil,
       "timerTicks": statTimerTicks,
+      "resumeFlush": statResumeFlush,
       "sinceShow": showingSince > 0 ? CACurrentMediaTime() - showingSince : -1,
       "startTries": startTries,
       "hostSide": Double(hostSide),
@@ -662,6 +733,7 @@ public class PictureInPicture: NSObject {
       "hostOrigin": hostOrigin,
       "windowBounds": windowBounds,
       "appState": appStateText(),
+      "audioActive": audioSessionActive,
       "layerStatus": layerStatusText(),
       "layerReady": layer.isReadyForMoreMediaData,
       "layerHidden": layer.isHidden,
@@ -683,8 +755,30 @@ public class PictureInPicture: NSObject {
       let session = AVAudioSession.sharedInstance()
       try session.setCategory(.playback, mode: .moviePlayback)
       try session.setActive(true)
+      audioSessionActive = session.isActive
     } catch {
+      audioSessionActive = false
       NSLog("PictureInPicture: AVAudioSession error: \(error)")
+    }
+  }
+
+  /// 小窗显示期间重试激活音频会话。必须在主线程调用。
+  ///
+  /// 后台态下第一次激活可能失败（被抢占、或会话正在切换），过一会儿再试一次即可。
+  private func retryAudioSession(_ attempts: [Double]) {
+    guard let delay = attempts.first else {
+      NSLog("PictureInPicture: audio session still inactive")
+      return
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+      guard let self = self else { return }
+      if self.audioSessionActive {
+        return
+      }
+      self.activateAudioSession()
+      if !self.audioSessionActive {
+        self.retryAudioSession(Array(attempts.dropFirst()))
+      }
     }
   }
 
@@ -888,12 +982,16 @@ extension PictureInPicture: AVPictureInPictureControllerDelegate {
     isShowing = true
     startDeadline = 0
     lastGoodHostSide = hostSide
+    possibleCache = pipController?.isPictureInPicturePossible ?? true
     resetDiagnostics()
     showingSince = CACurrentMediaTime()
     attachDisplayLayer()
     // 启动阶段为了「让系统判定画面源可用」补过几帧，那批样本的时间戳与队列状态
-    // 未必干净；小窗真正开始接管画面时清一次队列，让随后送进来的帧从头播放。
-    if displayLayer.status == .failed || !displayLayer.isReadyForMoreMediaData {
+    // 未必干净；小窗真正开始接管画面时清一次队列，让随后送进来的帧从头开始。
+    if displayLayer.status == .failed
+      || displayLayer.requiresFlushToResumeDecoding
+      || !displayLayer.isReadyForMoreMediaData
+    {
       displayLayer.flush()
     }
     lastPosition = -1
@@ -901,7 +999,13 @@ extension PictureInPicture: AVPictureInPictureControllerDelegate {
     // 系统正是从这一刻开始接管画面。两件事必须补齐：音频会话要活跃（否则小窗
     // 可能只有框没有画面），以及一条兜底的补帧通道（万一渲染回调不来）。
     activateAudioSession()
+    // 后台态下第一次激活可能不成，补一条重试阶梯。
+    if !audioSessionActive {
+      retryAudioSession([0.5, 1.5, 3.0])
+    }
     startKeepAlive()
+    // 立即补一帧，别等下一次渲染回调或保活定时器。
+    onNeedFrame?(true)
     eventCallback("VideoOutput.PictureInPictureStateChanged", ["active": true])
   }
 

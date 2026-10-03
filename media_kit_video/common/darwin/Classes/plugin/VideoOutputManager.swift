@@ -59,7 +59,15 @@ public class VideoOutputManager: NSObject {
     return self.videoOutputs[handle]?.pictureInPictureDiagnostics() ?? [:]
   }
 
-  /// 开启 / 关闭画中画弹幕。
+  /// 开启 / 关闭画中画「画面内诊断叠加层」。
+  public func setPictureInPictureDebugOverlay(
+    handle: Int64,
+    value: Bool
+  ) {
+    self.videoOutputs[handle]?.setPictureInPictureDebugOverlay(value)
+  }
+
+  /// 开呠 / 关闭画中画弹幕。
   public func setPictureInPictureDanmakuEnabled(
     handle: Int64,
     value: Bool
