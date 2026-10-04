@@ -516,15 +516,14 @@ public class PictureInPicture: NSObject {
     lastPosition = position
     syncTimebase(position)
 
-    // 有弹幕落在画面上时，先绘进帧的副本；否则直接使用原始帧（零额外开销）。
-    // 只有小窗真的显示出来了才绘制——仅仅「武装」了自动画中画时不应白白耗电。
-    var frame = pixelBuffer
-    if isShowing, danmaku.enabled,
-      danmaku.isActive(at: position),
-      let composed = danmaku.composite(pixelBuffer, at: position)
-    {
-      frame = composed
-    }
+    // 画面帧原样送入图层，不再做任何逐帧合成。
+    //
+    // 原先的「画中画弹幕」正是在这里把弹幕绘进帧的副本：每一帧一次整帧 memcpy、新建
+    // 一个 CoreGraphics 上下文、再对当前可见的每条弹幕逐条绘制文字（循环遍历最多
+    // 6000 条），而源帧取自 OpenGL 纹理缓存，还要对它 `CVPixelBufferLockBaseAddress`。
+    // 播放中这条路径每一帧都在跑，长时间播放会把 CPU 与内存带宽推满——现象即小窗卡死，
+    // 随后整个进程连新建网络连接都失败。该功能已按用户要求整体移除，小窗只显示画面本身。
+    let frame = pixelBuffer
     // 诊断叠加层：开机时把读数自身画进小窗。小窗里看得到这些字，就说明帧确实送到了
     // 图层，黑屏发生在「系统把图层内容接进小窗」那一环；一片纯黑连字也没有，则说明
     // 帧压根没送进去。这是零成本区分两类成因的办法（仅诊断时开启）。
