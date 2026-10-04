@@ -150,6 +150,14 @@ public class PictureInPicture: NSObject {
   /// 15 fps 的低速通道，与渲染回调共用 [onNeedFrame]，不改变正常路径的行为。
   private var keepAliveTimer: Timer?
 
+  /// 最近一次「样本真正进了图层」的时刻。
+  ///
+  /// 保活通道据此判断是否真的需要补帧：渲染回调要是正常在供帧，就一次都不该补。
+  private var lastLayerEnqueueAt: CFTimeInterval = 0
+
+  /// 保活通道因「渲染回调仍在正常供帧」而主动跳过的次数（诊断用）。
+  private var statKeepAliveSkipped = 0
+
   /// 小窗开始显示的时刻；`0` 表示当前未显示。
   private var showingSince: CFTimeInterval = 0
 
@@ -600,6 +608,8 @@ public class PictureInPicture: NSObject {
         layer.flush()
       }
       layer.enqueue(sampleBuffer)
+      // 记在主线程序列上：保活定时器也在主线程读它，这样读写天然串行，不需要加锁。
+      self.lastLayerEnqueueAt = CACurrentMediaTime()
     }
   }
 
@@ -669,6 +679,7 @@ public class PictureInPicture: NSObject {
     statThrottled = 0
     statCopyNil = 0
     statTimerTicks = 0
+    statKeepAliveSkipped = 0
     statResumeFlush = 0
     notReadySince = 0
     lastStuckFlush = 0
@@ -744,6 +755,7 @@ public class PictureInPicture: NSObject {
       "throttled": statThrottled,
       "copyNil": statCopyNil,
       "timerTicks": statTimerTicks,
+      "keepAliveSkipped": statKeepAliveSkipped,
       "resumeFlush": statResumeFlush,
       "sinceShow": showingSince > 0 ? CACurrentMediaTime() - showingSince : -1,
       "startTries": startTries,
@@ -813,6 +825,13 @@ public class PictureInPicture: NSObject {
     let timer = Timer(timeInterval: 1.0 / 15.0, repeats: true) { [weak self] _ in
       guard let self = self, self.isArmed else {
         self?.stopKeepAlive()
+        return
+      }
+      // 只在「渲染回调确实没在供帧」时才补。正常路径下渲染回调每渲染完一帧就会把样本
+      // 送进图层，这条通道因此几乎不会真的触发——它是兜底，不该变成一条常驻的固定频率
+      // 生产者：那会把 worker 的队列、以及整机的 CPU 与内核对象一起拖住，跑得越久越糟。
+      if CACurrentMediaTime() - self.lastLayerEnqueueAt < 0.2 {
+        self.statKeepAliveSkipped += 1
         return
       }
       self.statTimerTicks += 1
@@ -1020,6 +1039,9 @@ extension PictureInPicture: AVPictureInPictureControllerDelegate {
     }
     lastPosition = -1
     lastIdleEnqueue = 0
+    // 小窗刚开始显示时先当作「刚刚送到过帧」，让保活通道安静下来；渲染回调一旦真的
+    // 断了供帧，超过 0.2 秒它自然会接手。
+    lastLayerEnqueueAt = CACurrentMediaTime()
     // 系统正是从这一刻开始接管画面。两件事必须补齐：音频会话要活跃（否则小窗
     // 可能只有框没有画面），以及一条兜底的补帧通道（万一渲染回调不来）。
     activateAudioSession()

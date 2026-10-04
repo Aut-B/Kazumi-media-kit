@@ -46,6 +46,17 @@ public class VideoOutput: NSObject {
   #if os(iOS)
     /// 系统级画中画（iOS 15+，见 `PictureInPicture`）。
     private var pip: PictureInPicture?
+
+    /// 喂帧任务的合并标记：同一时刻最多只允许一个喂帧任务排在 `worker` 队列里。
+    ///
+    /// 喂帧请求有两个来源——媒体渲染回调（跟随视频帧率）与小窗保活通道（15 fps 定时器），
+    /// 二者共用同一条 worker 队列。而 worker 内部的队列没有上界，一旦「取像素缓冲 + 合
+    /// 成弹幕」的耗时长于请求到来的间隔，任务就会越堆越多：既拖慢排在后面的所有操作
+    /// （连 resize、dispose 都得排队），又让每一帧都攥着一张画布不放。这里做合并——
+    /// 已有任务在排队时直接丢弃本次请求，只把「强势补帧」的语义并进去。
+    private let feedLock = NSLock()
+    private var feedPending = false
+    private var feedForce = false
   #endif
 
   init(
@@ -214,10 +225,25 @@ public class VideoOutput: NSObject {
         eventCallback: self.pipEventCallback
       )
       // 启动阶段与小窗保活都会走这里：前者需要「强势补帧」（图层不就绪也要送进去），
-      // 后者走温和路径即可。取像素缓冲必须走渲染线程，因此这里只回投一个任务。
+      // 后者走温和路径即可。取像素缓冲必须走渲染线程，因此这里只回投一个任务；
+      // 任务同刻最多只排一个（见 [feedPending]），避免队列被高频补帧撑开。
       pip.onNeedFrame = { [weak self] force in
         guard let that = self else { return }
+        that.feedLock.lock()
+        if that.feedPending {
+          that.feedForce = that.feedForce || force
+          that.feedLock.unlock()
+          return
+        }
+        that.feedPending = true
+        that.feedForce = force
+        that.feedLock.unlock()
         that.worker.enqueue {
+          that.feedLock.lock()
+          let force = that.feedForce
+          that.feedPending = false
+          that.feedForce = false
+          that.feedLock.unlock()
           that.feedPictureInPicture(force: force)
         }
       }
@@ -348,7 +374,12 @@ public class VideoOutput: NSObject {
     texture.render(size)
 
     #if os(iOS)
-      feedPictureInPicture()
+      // 这一步要取像素缓冲，小窗显示时还要逐帧合成弹幕（每帧新建一张画布），过程中会
+      // 产生不少临时对象。渲染回调跑在媒体线程上，不能指望它自带自动释放池，这里补一层，
+      // 免得这些对象一路挂到进程结束（长时间播放会越积越多）。
+      autoreleasepool {
+        feedPictureInPicture()
+      }
 
       // 小窗显示期间改用异步通知：此时 App 多半已进入后台，主线程正忙于处理
       // 生命周期切换，用 `sync` 会把渲染线程一起堵住 —— 表现即系统小窗停止刷新、
