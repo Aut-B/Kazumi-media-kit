@@ -829,7 +829,11 @@ public class PictureInPicture: NSObject {
       // 只在「渲染回调确实没在供帧」时才补。正常路径下渲染回调每渲染完一帧就会把样本
       // 送进图层，这条通道因此几乎不会真的触发——它是兜底，不该变成一条常驻的固定频率
       // 生产者：那会把 worker 的队列、以及整机的 CPU 与内核对象一起拖住，跑得越久越糟。
-      if CACurrentMediaTime() - self.lastLayerEnqueueAt < 0.2 {
+      // 这里只跳过「刚刚才送过一帧」的情况（50ms 以内）。原来的 200ms 会让这条
+      // 通道实际只剩 5 fps，而且每次送的都是同一帧——6S 上小窗一卡一卡、画面定住
+      // 就是这么来的。补帧现在会先驱动一次渲染（见 VideoOutput.renderAndFeed…），
+      // 因此按 15 fps 正常走即可。
+      if CACurrentMediaTime() - self.lastLayerEnqueueAt < 0.05 {
         self.statKeepAliveSkipped += 1
         return
       }
