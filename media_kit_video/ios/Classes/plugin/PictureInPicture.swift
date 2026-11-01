@@ -599,15 +599,31 @@ public class PictureInPicture: NSObject {
         // （时间轴倒退、或渲染在后台被挂起），此时队列永远不会自己腾空。主动清一次，
         // 把管道重新打通，否则小窗会一直停在黑屏。
         let now = CACurrentMediaTime()
-        if isShowing {
+        // 这里原来只认 isShowing。自动进小窗（划回主屏幕）时系统经常不送
+        // didStart，isShowing 一直是 false，于是「图层不肯收样本」这件事
+        // 一次都不会被恢复——小窗就永远停在那一帧。后台态同样算「小窗在用」。
+        if isShowing || appIsBackground {
           if notReadySince == 0 {
             notReadySince = now
           } else if now - notReadySince > 1.0, now - lastStuckFlush > 2.0 {
             lastStuckFlush = now
             notReadySince = 0
             NSLog("PictureInPicture: layer stuck, flushing")
-            layerQueue.async {
+            // 光清图层不够：卡住时时间轴往往已经跑到样本前面，清完又被
+            // 旧时间轴卡一次。顺手把时间轴拉回当前播放位置。
+            let resumeAt = mpvPosition()
+            let resumeRate: Double = mpvFlag("pause") ? 0 : 1
+            layerQueue.async { [weak self] in
               layer.flush()
+              if #available(iOS 15.0, *), let timebase = self?.controlTimebase {
+                CMTimebaseSetTime(
+                  timebase,
+                  time: CMTime(seconds: resumeAt, preferredTimescale: 600)
+                )
+                if CMTimebaseGetRate(timebase) != resumeRate {
+                  CMTimebaseSetRate(timebase, rate: resumeRate)
+                }
+              }
             }
           }
         }
@@ -1066,10 +1082,15 @@ public class PictureInPicture: NSObject {
     guard let timebase = controlTimebase else {
       return
     }
-    CMTimebaseSetTime(
-      timebase,
-      time: CMTime(seconds: position, preferredTimescale: 600)
-    )
+    // 每帧都强行对时，图层的呈现时钟一直在抖：6S 这类老机器上表现为
+    // 「声音在走、画面不动」。只有明显跑偏（seek / 换源 / 卡顿后追帧）才校正。
+    let current = CMTimebaseGetTime(timebase).seconds
+    if !current.isFinite || abs(current - position) > 0.3 {
+      CMTimebaseSetTime(
+        timebase,
+        time: CMTime(seconds: position, preferredTimescale: 600)
+      )
+    }
     let rate: Double = mpvFlag("pause") ? 0 : 1
     if CMTimebaseGetRate(timebase) != rate {
       CMTimebaseSetRate(timebase, rate: rate)
