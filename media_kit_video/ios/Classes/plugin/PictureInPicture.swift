@@ -935,8 +935,9 @@ public class PictureInPicture: NSObject {
       leeway: .milliseconds(20)
     )
     source.setEventHandler { [weak self] in
+      // 已经解除武装：什么都不做即可。定时源由主线程上的 stop / disarm / didStop
+      // 统一收掉——这里**不能**顺手 stop，那会从补帧队列去改主线程持有的定时源引用。
       guard let self = self, self.isArmed else {
-        self?.stopKeepAlive()
         return
       }
       // 前台且小窗未显示时完全不插手：那时渲染回调一定在供帧。
