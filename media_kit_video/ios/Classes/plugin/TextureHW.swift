@@ -156,6 +156,7 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     // 图层——小窗就表现为「反复播放同一帧」。这里先短暂让出 CPU 重试，仍取不到就
     // 退而写当前帧（宁可轻微撕裂，也不要画面定住）。
     var textureContext = textureContexts.nextAvailable()
+    var reusedCurrent = false
     if textureContext == nil {
       for _ in 0..<2 {
         Thread.sleep(forTimeInterval: 0.002)
@@ -168,6 +169,7 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     if textureContext == nil {
       statRenderNilCount += 1
       textureContext = textureContexts.current
+      reusedCurrent = true
       if textureContext == nil {
         return
       }
@@ -201,7 +203,11 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
 
     glFlush()
 
-    textureContexts.pushAsReady(textureContext!)
+    // 复用 current 时绝不能 push：那会把同一块缓冲同时留在 _current 和 vailable，
+    // 之后它可能被当成空闲缓冲再次借出，两帧写进同一块内存。
+    if !reusedCurrent {
+      textureContexts.pushAsReady(textureContext!)
+    }
   }
 
   static private func getProcAddress(
