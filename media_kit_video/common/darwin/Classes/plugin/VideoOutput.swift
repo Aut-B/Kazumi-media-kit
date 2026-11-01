@@ -347,23 +347,11 @@ public class VideoOutput: NSObject {
 
       texture.resize(size)
 
-      // 同下：小窗显示（App 多在后台）期间不阻塞渲染线程。
-      var pipActive = false
-      #if os(iOS)
-        pipActive = pip?.isShowing == true
-      #endif
-      if pipActive {
-        DispatchQueue.main.async { [weak self] in
-          guard let that = self else { return }
-          // textureUpdateCallback must run on the main thread
-          that.textureUpdateCallback(that.textureId, size)
-        }
-      } else {
-        DispatchQueue.main.sync { [weak self] in
-          guard let that = self else { return }
-          // textureUpdateCallback must run on the main thread
-          that.textureUpdateCallback(that.textureId, size)
-        }
+      // 主线程可能正被系统降频（App 在后台 / 小窗显示中），这里一律异步投递：
+      // `textureUpdateCallback` 只要求跑在主线程，不要求调用方等它跑完。
+      DispatchQueue.main.async { [weak self] in
+        guard let that = self else { return }
+        that.textureUpdateCallback(that.textureId, size)
       }
     }
 
@@ -381,21 +369,22 @@ public class VideoOutput: NSObject {
         feedPictureInPicture()
       }
 
-      // 小窗显示期间改用异步通知：此时 App 多半已进入后台，主线程正忙于处理
-      // 生命周期切换，用 `sync` 会把渲染线程一起堵住 —— 表现即系统小窗停止刷新、
-      // 只剩黑屏。异步投递不会阻塞出帧，主线程空闲时自然消化。
-      if pip?.isShowing == true {
-        DispatchQueue.main.async { [weak self] in
-          guard let that = self else { return }
-          that.registry.textureFrameAvailable(that.textureId)
-        }
-        return
-      }
     #endif
 
-    DispatchQueue.main.sync { [weak self] in
+    notifyFrameAvailable()
+  }
+
+  /// 通知 Flutter「有新帧了」。
+  ///
+  /// `textureFrameAvailable` 必须跑在主线程，但**不能**用 `sync` 等它跑完：App 退到
+  /// 后台、或小窗正在显示时，主线程随时可能被系统降频甚至挂起，`sync` 会把渲染线程
+  /// 一起钉死 —— 出帧链路停摆，小窗就停在最后一帧（前台播放一切正常、一按 Home 就
+  /// 卡住，正是这个分支造成的）。异步投递同样满足 Flutter 的要求，多出来的通知会被
+  /// 引擎合并，不会堆积。
+  private func notifyFrameAvailable() {
+    DispatchQueue.main.async { [weak self] in
       guard let that = self else { return }
-      // Textures must be marked as available from the main thread
+      guard that.textureId >= 0, !that.disposed else { return }
       that.registry.textureFrameAvailable(that.textureId)
     }
   }

@@ -159,8 +159,28 @@ public class PictureInPicture: NSObject {
   )
   private var keepAliveSource: DispatchSourceTimer?
 
+  /// 图层操作专用串行队列。
+  ///
+  /// `AVSampleBufferDisplayLayer` 的 `enqueue` / `flush` 可以在任意线程调用（只要串行）。
+  /// 原先统一投到主队列：App 退到后台后主队列会被系统降频甚至挂起，样本于是再也进不了
+  /// 图层 —— 小窗就停在划走前的最后一帧。改到自己的串行队列后，喂帧链路完全不再依赖
+  /// 主线程，前台 / 后台的行为也就一致了。
+  private let layerQueue = DispatchQueue(
+    label: "media_kit.pip.layer",
+    qos: .userInitiated
+  )
+
+  /// 最近一次「按 controller 真实状态纠正 isShowing」的时刻（限频用）。
+  private var lastReconcile: CFTimeInterval = 0
+
   /// App 是否已退到后台（主线程维护，供补帧通道跨线程读取）。
   private var appIsBackground = false
+
+  /// App 是否已退到后台。供 `VideoOutput` 判断喂帧 / 通知策略：后台态下主线程随时
+  /// 可能被系统降频，任何「等主线程」的操作都必须绕开。
+  public var isAppBackground: Bool {
+    return appIsBackground
+  }
 
   /// 退到后台后向系统申请的续命任务：保证「小窗弹出来」这段时间进程不会被挂起。
   private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
@@ -467,6 +487,7 @@ public class PictureInPicture: NSObject {
     lastIdleEnqueue = 0
     startDeadline = 0
     showingSince = 0
+    lastReconcile = 0
     DispatchQueue.main.async { [weak self] in
       self?.hostView.alpha = PictureInPicture.hostIdleAlpha
       self?.stopKeepAlive()
@@ -487,7 +508,10 @@ public class PictureInPicture: NSObject {
 
     let layer = displayLayer
     let timebase = controlTimebase
-    DispatchQueue.main.async {
+    // 与 `enqueue` 投同一条串行队列：既保证「先清空、再入队新视频的帧」这个顺序，
+    // 也让切集不再依赖主线程 —— App 停在小窗里连续播放时，主线程随时可能被降频，
+    // 一旦这一步跑不到，新视频的帧就会顶在上一集的时间轴上，小窗随即变黑。
+    layerQueue.async {
       layer.flush()
       if #available(iOS 15.0, *), let timebase = timebase {
         CMTimebaseSetTime(timebase, time: .zero)
@@ -582,7 +606,7 @@ public class PictureInPicture: NSObject {
             lastStuckFlush = now
             notReadySince = 0
             NSLog("PictureInPicture: layer stuck, flushing")
-            DispatchQueue.main.async {
+            layerQueue.async {
               layer.flush()
             }
           }
@@ -593,10 +617,13 @@ public class PictureInPicture: NSObject {
     }
     notReadySince = 0
 
-    if !isShowing, !force {
+    if !isShowing, !force, !appIsBackground {
       // 小窗还没显示：仍要维持图层里有画面——系统正是据此判断「有内容可以画中画」，
       // 否则划回主屏幕时不会自动进入。但降到约 10 fps，避免长时间占住 Flutter
       // 那几个轮转使用的像素缓冲。
+      //
+      // 后台态例外：那正是「自动进入小窗」的窗口期——系统已经切走、`didStart` 还没
+      // 送到，此时若把帧率压到 10 fps，小窗一弹出来就是一顿一顿的。
       let now = CACurrentMediaTime()
       if now - lastIdleEnqueue < 0.1 {
         statThrottled += 1
@@ -609,7 +636,7 @@ public class PictureInPicture: NSObject {
     let position = mpvPosition()
     if lastPosition >= 0, position < lastPosition - 1 {
       // 播放位置大幅倒退说明换了视频源；时间轴倒退会让图层停止消化后续样本。
-      DispatchQueue.main.async {
+      layerQueue.async {
         layer.flush()
       }
     }
@@ -685,14 +712,17 @@ public class PictureInPicture: NSObject {
     }
 
     statEnqueued += 1
-    DispatchQueue.main.async { [weak self] in
+    layerQueue.async { [weak self] in
       guard let self = self else {
         return
       }
       // 后台态（例如 App 被另一个进程托管、自己始终处于后台）下，图层可能进入
       // 「需要先清空队列才能恢复解码」的状态。此时若直接入队，样本会被图层静默地
       // 丢掉 —— 现象恰好是「入队数一直涨、小窗始终黑」。此处按官方文档给出的做法
-      // 先 flush 再入队；两者都投在同一条主队列上，先后顺序有保证。
+      // 先 flush 再入队；两者都投在同一条串行队列上，先后顺序有保证。
+      //
+      // 注意：这条队列**不是**主队列。App 退到后台后主队列会被系统降频，样本就再也
+      // 进不了图层；`AVSampleBufferDisplayLayer` 只要求调用串行，并不要求主线程。
       let now = CACurrentMediaTime()
       let resumeFlush =
         layer.requiresFlushToResumeDecoding && now - self.lastResumeFlush > 0.2
@@ -707,7 +737,7 @@ public class PictureInPicture: NSObject {
         layer.flush()
       }
       layer.enqueue(sampleBuffer)
-      // 写在主线程上，读的一方是独立队列上的补帧通道，因此这个读数带锁。
+      // 写在图层队列上，读的一方是补帧通道，因此这个读数带锁。
       self.lastLayerEnqueueAt = CACurrentMediaTime()
     }
   }
@@ -930,9 +960,9 @@ public class PictureInPicture: NSObject {
     stopKeepAlive()
     let source = DispatchSource.makeTimerSource(queue: keepAliveQueue)
     source.schedule(
-      deadline: .now() + 1.0 / 15.0,
-      repeating: 1.0 / 15.0,
-      leeway: .milliseconds(20)
+      deadline: .now() + 1.0 / 30.0,
+      repeating: 1.0 / 30.0,
+      leeway: .milliseconds(10)
     )
     source.setEventHandler { [weak self] in
       // 已经解除武装：什么都不做即可。定时源由主线程上的 stop / disarm / didStop
@@ -945,16 +975,27 @@ public class PictureInPicture: NSObject {
         self.statKeepAliveSkipped += 1
         return
       }
-      // 刚刚才送过一帧（50ms 内）说明渲染回调仍在正常工作，跳过。
+      // 系统有时不会把「已进入画中画」的 delegate 回调送过来，`isShowing` 于是
+      // 一直是 false：喂帧被降频、通知走错分支，小窗就定在最后一帧。这里按
+      // controller 的真实状态纠正一次（限频，避免在后台空转）。
+      if !self.isShowing {
+        let now = CACurrentMediaTime()
+        if now - self.lastReconcile > 0.5 {
+          self.lastReconcile = now
+          self.reconcileShowingState()
+        }
+      }
+      // 刚刚才送过一帧（20ms 内）说明渲染回调仍在正常工作，跳过。
       let now = CACurrentMediaTime()
       let gap = now - self.lastLayerEnqueueAt
-      if gap < 0.05 {
+      if gap < 0.02 {
         self.statKeepAliveSkipped += 1
         return
       }
       self.statTimerTicks += 1
-      // 图层已经超过 0.5 秒没拿到新样本：这次必须强制补（绕开「图层不就绪」的丢弃）。
-      let stalled = gap > 0.5
+      // 图层已经超过 0.2 秒没拿到新样本：这次必须强制补（绕开「图层不就绪」的丢弃）。
+      // 阈值不能放大：0.5 秒的停顿在小窗里肉眼就是「卡住了」。
+      let stalled = gap > 0.2
       if stalled {
         self.statStallRecover += 1
       }
@@ -962,6 +1003,29 @@ public class PictureInPicture: NSObject {
     }
     source.resume()
     keepAliveSource = source
+  }
+
+  /// 系统已进入画中画、但 delegate 回调没送到时，按 controller 的真实状态补齐。
+  ///
+  /// `AVPictureInPictureController` 的属性只能在主线程读，因此这里回主线程确认一次；
+  /// 确认后立刻把喂帧策略切到「小窗显示中」——否则后台窗口期会一直按 10 fps 降频，
+  /// 小窗里就是一顿一顿甚至定帧。
+  private func reconcileShowingState() {
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else { return }
+      guard !self.isShowing else { return }
+      guard self.pipController?.isPictureInPictureActive == true else { return }
+      NSLog("PictureInPicture: recovered missing didStart callback")
+      self.isArmed = true
+      self.isShowing = true
+      self.showingSince = CACurrentMediaTime()
+      self.lastPosition = -1
+      self.lastIdleEnqueue = 0
+      self.lastLayerEnqueueAt = CACurrentMediaTime()
+      self.activateAudioSession()
+      self.startKeepAlive()
+      self.onNeedFrame?(true)
+    }
   }
 
   /// 停止低速补帧通道。
@@ -1192,6 +1256,7 @@ extension PictureInPicture: AVPictureInPictureControllerDelegate {
   ) {
     isShowing = false
     showingSince = 0
+    lastReconcile = 0
     stopKeepAlive()
     endBackgroundTaskIfNeeded()
     eventCallback("VideoOutput.PictureInPictureStateChanged", ["active": false])

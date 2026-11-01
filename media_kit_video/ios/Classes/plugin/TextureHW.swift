@@ -89,9 +89,11 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
       renderContext,
       { (ctx) in
         let that = unsafeBitCast(ctx, to: TextureHW.self)
-        DispatchQueue.main.async {
-          that.updateCallback()
-        }
+        // 直接在当前（mpv 渲染）线程回调，不再绕道主队列：`updateCallback` 自己会把
+        // 任务排进 `VideoOutput` 的专用 worker 线程，这里再跳一次主线程纯属多余；
+        // 而 App 退到后台后主队列会被系统降频甚至挂起，这一跳会让整条出帧链路跟着
+        // 停摆 —— 小窗就定在划走前的最后一帧。
+        that.updateCallback()
       },
       UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
     )
