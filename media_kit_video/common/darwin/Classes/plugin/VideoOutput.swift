@@ -244,7 +244,7 @@ public class VideoOutput: NSObject {
           that.feedPending = false
           that.feedForce = false
           that.feedLock.unlock()
-          that.feedPictureInPicture(force: force)
+          that.renderAndFeedPictureInPicture(force: force)
         }
       }
       self.pip = pip
@@ -401,6 +401,24 @@ public class VideoOutput: NSObject {
   }
 
   #if os(iOS)
+    /// 补帧：先让 mpv 真正渲染一帧，再把这一帧喂给画中画图层。
+    ///
+    /// 只调用 `copyPixelBuffer()` 拿到的是「上一次渲染留下的那一帧」。App 退到
+    /// 后台后 Flutter 不再请求纹理，mpv 的渲染回调随之停摆，补帧通道于是把同一帧
+    /// 反复入队——小窗里就是画面定住不动（6S 这类老机器上尤其明显，因为它的渲染
+    /// 回调更容易被系统挂起）。所以补帧必须自己驱动一次渲染。
+    private func renderAndFeedPictureInPicture(force: Bool) {
+      let size = videoSize
+      if size.width > 0 && size.height > 0 {
+        if currentSize != size {
+          currentSize = size
+          texture.resize(size)
+        }
+        texture.render(size)
+      }
+      feedPictureInPicture(force: force)
+    }
+
     /// 把最新渲染完成的一帧喂给画中画图层。
     ///
     /// - Parameter force: 绕过「小窗未显示时降频」的限制，用于启动阶段主动补帧。
