@@ -146,10 +146,31 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
     textureContexts.reinit(objects: [], skipCheckArgs: true)
   }
 
+  /// 补帧通道遇到「轮转缓冲全被占住」而没能渲染的次数（诊断用）。
+  public private(set) var statRenderNilCount = 0
+
   public func render(_ size: CGSize) {
-    let textureContext = textureContexts.nextAvailable()
+    // 三块轮转缓冲通常至少有一块空闲。但小窗在后台持续补帧时，Flutter 与
+    // AVSampleBufferDisplayLayer 都可能短暂持有像素缓冲，偶尔会撞上「一块都不空」。
+    // 老实现此时静默 return：这一帧没渲染，`copyPixelBuffer()` 于是又把上一帧送进
+    // 图层——小窗就表现为「反复播放同一帧」。这里先短暂让出 CPU 重试，仍取不到就
+    // 退而写当前帧（宁可轻微撕裂，也不要画面定住）。
+    var textureContext = textureContexts.nextAvailable()
     if textureContext == nil {
-      return
+      for _ in 0..<2 {
+        Thread.sleep(forTimeInterval: 0.002)
+        textureContext = textureContexts.nextAvailable()
+        if textureContext != nil {
+          break
+        }
+      }
+    }
+    if textureContext == nil {
+      statRenderNilCount += 1
+      textureContext = textureContexts.current
+      if textureContext == nil {
+        return
+      }
     }
 
     EAGLContext.setCurrent(context)
