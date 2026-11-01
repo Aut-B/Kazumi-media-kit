@@ -359,7 +359,16 @@ public class VideoOutput: NSObject {
       return
     }
 
-    texture.render(size)
+    #if os(iOS)
+      // 后台态下这条路径也在给小窗供帧：必须等这一帧写完再取，否则取到的是上一帧。
+      if pip?.isAppBackground == true {
+        texture.renderSynchronized(size)
+      } else {
+        texture.render(size)
+      }
+    #else
+      texture.render(size)
+    #endif
 
     #if os(iOS)
       // 这一步要取像素缓冲，小窗显示时还要逐帧合成弹幕（每帧新建一张画布），过程中会
@@ -403,7 +412,9 @@ public class VideoOutput: NSObject {
           currentSize = size
           texture.resize(size)
         }
-        texture.render(size)
+        // 同步渲染：等这一帧真正写进 IOSurface 再取，否则后台补帧会一直把
+        // 「上一帧」送给小窗（6S 上表现为反复播放同一帧）。
+        texture.renderSynchronized(size)
       }
       feedPictureInPicture(force: force)
     }

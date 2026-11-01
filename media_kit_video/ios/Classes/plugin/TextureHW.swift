@@ -1,3 +1,4 @@
+import CoreVideo
 import Flutter
 import OpenGLES
 
@@ -152,6 +153,21 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
   public private(set) var statRenderNilCount = 0
 
   public func render(_ size: CGSize) {
+    render(size, waitForCompletion: false)
+  }
+
+  /// 同 [render]，但等 GPU 真正把这一帧写完再返回。
+  ///
+  /// 画中画取帧必须走这条路：`copyPixelBuffer()` 交出去的 IOSurface 会被
+  /// `AVSampleBufferDisplayLayer` 读取（iOS 15 起小窗的合成发生在系统进程里）。
+  /// `glFlush()` 只是把命令提交给 GPU，**不保证**写完；老机型（6S 这类）GPU 慢、
+  /// 且 App 已在后台被降频，读的一方很容易一直读到上一帧——现象就是小窗反复
+  /// 显示同一帧。这里用 `glFinish()` + `CVOpenGLESTextureCacheFlush` 把写入落定。
+  public func renderSynchronized(_ size: CGSize) {
+    render(size, waitForCompletion: true)
+  }
+
+  private func render(_ size: CGSize, waitForCompletion: Bool) {
     // 三块轮转缓冲通常至少有一块空闲。但小窗在后台持续补帧时，Flutter 与
     // AVSampleBufferDisplayLayer 都可能短暂持有像素缓冲，偶尔会撞上「一块都不空」。
     // 老实现此时静默 return：这一帧没渲染，`copyPixelBuffer()` 于是又把上一帧送进
@@ -203,7 +219,12 @@ public class TextureHW: NSObject, FlutterTexture, ResizableTextureProtocol {
 
     mpv_render_context_render(renderContext, &params)
 
-    glFlush()
+    if waitForCompletion {
+      glFinish()
+      CVOpenGLESTextureCacheFlush(textureCache, 0)
+    } else {
+      glFlush()
+    }
 
     // 复用 current 时绝不能 push：那会把同一块缓冲同时留在 _current 和 vailable，
     // 之后它可能被当成空闲缓冲再次借出，两帧写进同一块内存。

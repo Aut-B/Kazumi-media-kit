@@ -241,6 +241,44 @@ public class PictureInPicture: NSObject {
   /// 最近一次「恢复冲洗」的时刻，用于限制冲洗频率。
   private var lastResumeFlush: CFTimeInterval = 0
 
+  // MARK: - 累计计数（不随单次启动清零）
+  //
+  // 面板读数只能在回到前台之后读：那时 `showing` 必然为 false，单次计数又已被
+  // `resetDiagnostics()` 清过，于是永远看不出后台那一段的真相。下面这几个计数只在
+  // [start] / [arm] 时归零，专门回答「系统到底有没有送 didStart」这类关键问题。
+
+  private var statDidStart = 0
+  private var statDidStop = 0
+  private var statReconcileTry = 0
+  private var statReconcileHit = 0
+  private var statBgEnqueued = 0
+  private var statFgEnqueued = 0
+  private var statStartCalls = 0
+  private var statStartFail = 0
+
+  /// 连续两次入队的画面内容完全相同（签名一致）的次数。
+  ///
+  /// 这是区分「帧确实进了图层、但内容是同一帧」与「内容在变、图层却没显示」的唯一
+  /// 依据：前者说明渲染 / mpv 侧没出新画面，后者说明问题在小窗那一环。
+  private var statSameFrame = 0
+  private var lastFrameSignature: UInt64 = 0
+  private var hasFrameSignature = false
+
+  /// 「上一次后台窗口期」的汇总。卡帧只发生在这一段，而读数只能在回前台后取，
+  /// 所以必须在这里把起点与基线记下来，否则面板永远是「小窗没在显示」。
+  private var bgSegmentStart: CFTimeInterval = 0
+  private var lastBgSeconds: Double = 0
+  private var lastBgEnqueued: Int = 0
+  private var lastBgSameFrame: Int = 0
+  private var lastBgPosition: Double = 0
+  private var lastBgDidStart: Int = 0
+  private var lastBgStartCalls: Int = 0
+  private var bgBaseEnqueued = 0
+  private var bgBaseSameFrame = 0
+  private var bgBaseDidStart = 0
+  private var bgBaseStartCalls = 0
+  private var bgBasePosition: Double = 0
+
   /// 由主线程维护的「系统是否认为可以画中画」缓存。
   ///
   /// 渲染线程要把它画进诊断叠加层，而 `AVPictureInPictureController` 的属性只能在
@@ -269,6 +307,7 @@ public class PictureInPicture: NSObject {
 
   @objc private func handleDidEnterBackground() {
     appIsBackground = true
+    beginBackgroundSegment()
     guard isArmed else {
       return
     }
@@ -279,12 +318,34 @@ public class PictureInPicture: NSObject {
     }
     beginBackgroundTaskIfNeeded()
     startKeepAlive()
+    // 小窗已经在显示时，系统会在切到后台的瞬间让图层暂停消化队列里的样本：队列
+    // 看起来还是满的、`isReadyForMoreMediaData` 也可能一直不恢复，小窗就定在最后
+    // 一帧。主动清一次队列并把时间轴拉回当前播放位置，让新帧从头开始进。
+    if isShowing {
+      let layer = displayLayer
+      let timebase = controlTimebase
+      let resumeAt = mpvPosition()
+      let resumeRate: Double = mpvFlag("pause") ? 0 : 1
+      layerQueue.async {
+        layer.flush()
+        if #available(iOS 15.0, *), let timebase = timebase {
+          CMTimebaseSetTime(
+            timebase,
+            time: CMTime(seconds: resumeAt, preferredTimescale: 600)
+          )
+          if CMTimebaseGetRate(timebase) != resumeRate {
+            CMTimebaseSetRate(timebase, rate: resumeRate)
+          }
+        }
+      }
+    }
     // 立刻补一帧：后台切换的瞬间系统最容易把渲染回调掐掉。
     onNeedFrame?(true)
   }
 
   @objc private func handleWillEnterForeground() {
     appIsBackground = false
+    endBackgroundSegment()
     endBackgroundTaskIfNeeded()
   }
 
@@ -358,6 +419,7 @@ public class PictureInPicture: NSObject {
 
     isArmed = true
     resetDiagnostics()
+    resetCumulative()
     hostSide = lastGoodHostSide
     startTries = 0
     startDeadline = CACurrentMediaTime() + 3.0
@@ -385,6 +447,7 @@ public class PictureInPicture: NSObject {
 
     if controller.isPictureInPicturePossible {
       startDeadline = 0
+      statStartCalls += 1
       controller.startPictureInPicture()
       return
     }
@@ -440,6 +503,7 @@ public class PictureInPicture: NSObject {
       return
     }
     isArmed = true
+    resetCumulative()
     hostSide = lastGoodHostSide
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
@@ -554,12 +618,17 @@ public class PictureInPicture: NSObject {
     // 画中画需要「播放」类音频会话；这里补齐，避免被系统中断。
     activateAudioSession()
 
-    attachDisplayLayer()
-    setupTimebase()
-
     if let controller = pipController {
+      // 控制器已建好：只有图层真的掉了才补挂。无条件 `attachDisplayLayer()` 会在
+      // 后台把图层从小窗窗口里抢回宿主视图，小窗立刻定格。
+      if displayLayer.superlayer == nil {
+        attachDisplayLayer()
+      }
       return controller
     }
+
+    attachDisplayLayer()
+    setupTimebase()
 
     let contentSource = AVPictureInPictureController.ContentSource(
       sampleBufferDisplayLayer: displayLayer,
@@ -584,6 +653,11 @@ public class PictureInPicture: NSObject {
       return
     }
     statAttempt += 1
+    if appIsBackground {
+      statBgEnqueued += 1
+    } else {
+      statFgEnqueued += 1
+    }
 
     guard isArmed else {
       statNotArmed += 1
@@ -727,6 +801,23 @@ public class PictureInPicture: NSObject {
       )
     }
 
+    // 「画面不换」有两种完全不同的成因：渲染出来就是同一帧，或者内容在变但图层
+    // 没显示。入队前算一次内容签名，就能把两者分开。
+    //
+    // 只在后台窗口期取样：那时补帧走同步渲染（`renderSynchronized`），缓冲已经写完，
+    // 锁基地址是安全的。前台正常播放不取样——GPU 可能还在写这块缓冲，锁它既没有
+    // 意义，还可能反过来拖慢渲染。
+    if appIsBackground {
+      let signature = frameSignature(pixelBuffer)
+      if signature != 0 {
+        if hasFrameSignature, signature == lastFrameSignature {
+          statSameFrame += 1
+        }
+        lastFrameSignature = signature
+        hasFrameSignature = true
+      }
+    }
+
     statEnqueued += 1
     layerQueue.async { [weak self] in
       guard let self = self else {
@@ -815,6 +906,105 @@ public class PictureInPicture: NSObject {
 
   // MARK: - 诊断
 
+  /// 清零「累计」计数。只在真正发起一次画中画（[start] / [arm]）时调用。
+  ///
+  /// **不能**塞进 [resetDiagnostics]：`didStart` 里也会调它，那样 `didStart` 就永远
+  /// 是 0，等于把最关键的读数抹掉了。
+  private func resetCumulative() {
+    statDidStart = 0
+    statDidStop = 0
+    statReconcileTry = 0
+    statReconcileHit = 0
+    statBgEnqueued = 0
+    statFgEnqueued = 0
+    statStartCalls = 0
+    statStartFail = 0
+    statSameFrame = 0
+    hasFrameSignature = false
+  }
+
+  /// 开始记录一段「后台窗口期」。
+  private func beginBackgroundSegment() {
+    bgSegmentStart = CACurrentMediaTime()
+    bgBaseEnqueued = statEnqueued
+    bgBaseSameFrame = statSameFrame
+    bgBaseDidStart = statDidStart
+    bgBaseStartCalls = statStartCalls
+    bgBasePosition = mpvPosition()
+  }
+
+  /// 收尾一段「后台窗口期」，把增量存下来供回前台后的读数使用。
+  private func endBackgroundSegment() {
+    guard bgSegmentStart > 0 else {
+      return
+    }
+    let snapshot = bgSnapshot()
+    lastBgSeconds = snapshot.seconds
+    lastBgEnqueued = snapshot.enqueued
+    lastBgSameFrame = snapshot.sameFrame
+    lastBgPosition = snapshot.position
+    lastBgDidStart = snapshot.didStart
+    lastBgStartCalls = snapshot.startCalls
+    bgSegmentStart = 0
+  }
+
+  private func bgSnapshot() -> (
+    seconds: Double, enqueued: Int, sameFrame: Int,
+    position: Double, didStart: Int, startCalls: Int
+  ) {
+    if bgSegmentStart > 0 {
+      return (
+        CACurrentMediaTime() - bgSegmentStart,
+        Swift.max(0, statEnqueued - bgBaseEnqueued),
+        Swift.max(0, statSameFrame - bgBaseSameFrame),
+        mpvPosition() - bgBasePosition,
+        Swift.max(0, statDidStart - bgBaseDidStart),
+        Swift.max(0, statStartCalls - bgBaseStartCalls)
+      )
+    }
+    return (
+      lastBgSeconds, lastBgEnqueued, lastBgSameFrame,
+      lastBgPosition, lastBgDidStart, lastBgStartCalls
+    )
+  }
+
+  /// 计算一帧内容的粗签名：只采样四行各 64 字节，成本可忽略。
+  private func frameSignature(_ buffer: CVPixelBuffer) -> UInt64 {
+    guard CVPixelBufferGetPlaneCount(buffer) == 0 else {
+      return 0
+    }
+    guard CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess else {
+      return 0
+    }
+    defer {
+      CVPixelBufferUnlockBaseAddress(buffer, .readOnly)
+    }
+    guard let base = CVPixelBufferGetBaseAddress(buffer) else {
+      return 0
+    }
+    let height = CVPixelBufferGetHeight(buffer)
+    let width = CVPixelBufferGetWidth(buffer)
+    let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
+    guard height > 0, width > 0, bytesPerRow > 0 else {
+      return 0
+    }
+    let rowBytes = Swift.min(64, Swift.max(8, width * 4))
+    let raw = base.assumingMemoryBound(to: UInt8.self)
+    var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+    for row in 0..<4 {
+      let y = height * (row * 2 + 1) / 8
+      let offset = y * bytesPerRow + (width * 4 - rowBytes) / 2
+      guard offset + rowBytes <= height * bytesPerRow else {
+        continue
+      }
+      for i in 0..<rowBytes {
+        hash ^= UInt64(raw[offset + i])
+        hash = hash &* 0x0000_0100_0000_01b3
+      }
+    }
+    return hash
+  }
+
   /// 重置诊断计数（每次真正发起 / 进入画中画时调用）。
   private func resetDiagnostics() {
     statAttempt = 0
@@ -829,6 +1019,15 @@ public class PictureInPicture: NSObject {
     notReadySince = 0
     lastStuckFlush = 0
     lastResumeFlush = 0
+    // 后台窗口期内（自动进小窗时 `didStart` 会调到这里）清零单次计数，
+    // 基线要跟着挪，否则「后台入队」会算成负数。
+    if bgSegmentStart > 0 {
+      bgBaseEnqueued = 0
+      bgBaseSameFrame = 0
+      bgBaseDidStart = statDidStart
+      bgBaseStartCalls = statStartCalls
+      bgBasePosition = mpvPosition()
+    }
   }
 
   /// 供画面内诊断叠加层显示的一行行读数。
@@ -881,6 +1080,7 @@ public class PictureInPicture: NSObject {
     if #available(iOS 15.0, *), let timebase = controlTimebase {
       rate = CMTimebaseGetRate(timebase)
     }
+    let segment = bgSnapshot()
     // 画面源在窗口里的落点与窗口自身尺寸：用于排查「贴边被裁掉、系统不认可见性」。
     var hostOrigin = "nil"
     var windowBounds = "nil"
@@ -904,6 +1104,21 @@ public class PictureInPicture: NSObject {
       "stallRecover": statStallRecover,
       "renderNil": statRenderNil,
       "resumeFlush": statResumeFlush,
+      "didStart": statDidStart,
+      "didStop": statDidStop,
+      "reconcileTry": statReconcileTry,
+      "reconcileHit": statReconcileHit,
+      "bgEnqueued": statBgEnqueued,
+      "fgEnqueued": statFgEnqueued,
+      "startCalls": statStartCalls,
+      "startFail": statStartFail,
+      "sameFrame": statSameFrame,
+      "bgSeconds": segment.seconds,
+      "bgEnqueuedDelta": segment.enqueued,
+      "bgSameFrameDelta": segment.sameFrame,
+      "bgPositionDelta": segment.position,
+      "bgDidStartDelta": segment.didStart,
+      "bgStartCallsDelta": segment.startCalls,
       "sinceShow": showingSince > 0 ? CACurrentMediaTime() - showingSince : -1,
       "startTries": startTries,
       "hostSide": Double(hostSide),
@@ -1029,9 +1244,11 @@ public class PictureInPicture: NSObject {
   private func reconcileShowingState() {
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
+      self.statReconcileTry += 1
       guard !self.isShowing else { return }
       guard self.pipController?.isPictureInPictureActive == true else { return }
       NSLog("PictureInPicture: recovered missing didStart callback")
+      self.statReconcileHit += 1
       self.isArmed = true
       self.isShowing = true
       self.showingSince = CACurrentMediaTime()
@@ -1115,7 +1332,10 @@ public class PictureInPicture: NSObject {
     // 小窗显示期间图层归系统的画中画通道使用：这时候把它从当前父层摘下来再挂回
     // 宿主视图，等于在系统正读这块图层时把它抽走，小窗会停在抽走前的最后一帧。
     // 只有「图层根本没挂上」时才需要补挂。
-    if isShowing, displayLayer.superlayer != nil,
+    // 后台态同样算「小窗在用」：自动进小窗时系统经常不送 didStart，`isShowing`
+    // 一直是 false；此时若无条件把图层挂回宿主视图，等于把它从小窗窗口里抢出来，
+    // 小窗当场定格在最后一帧。
+    if isShowing || appIsBackground, displayLayer.superlayer != nil,
       displayLayer.superlayer !== hostView.layer
     {
       return
@@ -1234,6 +1454,7 @@ extension PictureInPicture: AVPictureInPictureControllerDelegate {
   ) {
     // 小窗已经出现，说明系统认可这个画面源。此刻无论此前状态如何，都保证图层
     // 处于「提供画面」状态，否则小窗会定格在最后一帧、甚至全黑。
+    statDidStart += 1
     isArmed = true
     isShowing = true
     startDeadline = 0
@@ -1275,6 +1496,7 @@ extension PictureInPicture: AVPictureInPictureControllerDelegate {
   public func pictureInPictureControllerDidStopPictureInPicture(
     _ pictureInPictureController: AVPictureInPictureController
   ) {
+    statDidStop += 1
     isShowing = false
     showingSince = 0
     lastReconcile = 0
@@ -1288,6 +1510,7 @@ extension PictureInPicture: AVPictureInPictureControllerDelegate {
     failedToStartPictureInPictureWithError error: Error
   ) {
     startDeadline = 0
+    statStartFail += 1
     emitError("启动画中画失败：\(error.localizedDescription)")
   }
 
