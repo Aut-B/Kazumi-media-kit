@@ -1625,12 +1625,17 @@ public class PictureInPicture: NSObject {
       framePool = nil
       framePoolWidth = width
       framePoolHeight = height
+      // 给池子设一个存活上限：图层卡住时样本会一直攥着缓冲不放，6S 内存小，
+      // 宁可退回「直接交轮转缓冲」（可能偶发一帧不干净）也不能把内存吃穿。
+      // 限额只能在建池时给：CVPixelBufferPoolCreatePixelBufferWithAuxiliaryAttributes
+      // 在 iOS SDK 里没导出，用它会直接编译不过。
       let attributes: [String: Any] = [
         kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
         kCVPixelBufferWidthKey as String: width,
         kCVPixelBufferHeightKey as String: height,
         kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
         kCVPixelBufferMetalCompatibilityKey as String: true,
+        kCVPixelBufferPoolAllocationThresholdKey as String: 8,
       ]
       var pool: CVPixelBufferPool?
       CVPixelBufferPoolCreate(
@@ -1643,16 +1648,10 @@ public class PictureInPicture: NSObject {
     }
     guard let pool = framePool else { return nil }
     var destination: CVPixelBuffer?
-    // 给池子设一个存活上限：图层卡住时样本会一直攥着缓冲不放，6S 内存小，
-    // 宁可退回「直接交轮转缓冲」（可能偶发一帧不干净）也不能把内存吃穿。
-    let aux: [String: Any] = [
-      kCVPixelBufferPoolAllocationThresholdKey as String: 8
-    ]
     guard
-      CVPixelBufferPoolCreatePixelBufferWithAuxiliaryAttributes(
+      CVPixelBufferPoolCreatePixelBuffer(
         kCFAllocatorDefault,
         pool,
-        aux as CFDictionary,
         &destination
       ) == kCVReturnSuccess,
       let dest = destination
