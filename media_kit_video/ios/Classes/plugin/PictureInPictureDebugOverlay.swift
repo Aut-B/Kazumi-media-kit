@@ -3,20 +3,22 @@ import CoreText
 import Foundation
 import UIKit
 
-/// 画中画「画面内」诊断叠加层（仅排障用）。
+/// 把读数直接画进「画面内」诊断叠加层（仅排障用）。
 ///
 /// 系统小窗只显示 `AVSampleBufferDisplayLayer` 里的内容，Flutter 画的东西一概进不去；
-/// 反过来说，**把读数直接画进送入图层的帧里，小窗就必然会显示它**。因此这一层能一次
-/// 把「小窗黑屏」切成两类，无需用户去翻日志或复制对话框：
+/// 反过来说，**把读数直接画进送入图层的帧里，小窗就必然会显示它**。因此这一层能把
+/// 「小窗黑屏」切成两类，无需用户去翻日志或复制对话框：
 ///
-/// * 小窗里看得到数字与移动色块 → 画面帧确实送到了图层，黑屏发生在「系统把图层内容
+/// * 小窗里看得到这些数字 → 画面帧确实送到了图层，黑屏发生在「系统把图层内容
 ///   接进小窗」这一环；
-/// * 小窗一片纯黑、连字都没有 → 帧压根没送进去，问题在出帧 / 取帧 / 入队这条链上。
+/// * 小窗里一片纯黑、连字都没有 → 帧压根没送进去，问题在出帧 / 取帧 / 入队这条链上。
 ///
-/// 色块每帧横向移动一小段：静止的画面（帧送出去了但不再更新）与完全不显示，也能一眼
-/// 区分开。
+/// 这里**刻意不画任何逐帧移动的色块**：早先底部那条红条本意是「画面还在刷新」的
+/// 指示器，但在真机上就是小窗里一直闪红光，反而盖住了真正要看的东西。文字本身
+/// 每帧都在变，足够判断刷新，不需要色块。
 ///
-/// 仅在诊断时开启；开启后每帧多一次整帧拷贝与一次文字绘制，正常播放时不开。
+/// 仅在诊断时开启；开启后每帧多一次整帧拷贝与一次文字绘制，正常播放时不启。
+
 public final class PictureInPictureDebugOverlay {
   /// 是否启用。由 Dart 侧（多任务模式）打开。
   public var enabled = false
@@ -26,9 +28,6 @@ public final class PictureInPictureDebugOverlay {
   private var width = 0
   private var height = 0
   private var cursor = 0
-
-  /// 已绘制的帧数，用于让色块逐帧移动。
-  private var tick = 0
 
   public init() {}
 
@@ -88,7 +87,7 @@ public final class PictureInPictureDebugOverlay {
 
   // MARK: - 绘制
 
-  /// 在 [base] 指向的 BGRA 位图上绘制读数条与移动色块。
+  /// 在 [base] 指向的 BGRA 位图上绘制读数条。
   ///
   /// 与弹幕层同样的注意点：`CGContext` 必须在返回前走完生命周期，否则调用方一解锁
   /// 帧缓冲，上下文手里的位图指针就悬空了。
@@ -118,7 +117,6 @@ public final class PictureInPictureDebugOverlay {
     context.setAllowsFontSubpixelPositioning(false)
     context.setAllowsFontSubpixelQuantization(false)
 
-    tick += 1
     let frameWidth = CGFloat(width)
     let frameHeight = CGFloat(height)
 
@@ -152,19 +150,6 @@ public final class PictureInPictureDebugOverlay {
       )
       CTLineDraw(ctLine, context)
     }
-
-    // 底部一条逐帧右移的色块：画面是否还在刷新，一眼可辨。
-    let barWidth = frameWidth * 0.16
-    let phase = CGFloat(tick % 40) / 40
-    context.setFillColor(UIColor(red: 1, green: 0.23, blue: 0.19, alpha: 1).cgColor)
-    context.fill(
-      CGRect(
-        x: phase * (frameWidth - barWidth),
-        y: 0,
-        width: barWidth,
-        height: max(5, frameHeight * 0.045)
-      )
-    )
   }
 
   // MARK: - 帧缓冲复用

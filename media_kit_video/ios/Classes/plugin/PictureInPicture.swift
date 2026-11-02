@@ -220,6 +220,26 @@ public class PictureInPicture: NSObject {
   /// 保活通道发现「图层长时间没有新样本」并强制补帧的次数。
   private var statStallRecover = 0
 
+  /// 后台「进度不走」看门狗主动重推播放的次数（诊断用）。
+  ///
+  /// 15pm 上出现过一种与 6S 完全不同的卡法：帧以 30fps 稳定送进图层、内容甚至还在
+  /// 变，但 mpv 的 `time-pos` 一秒都不动 —— 播放循环本身被挂起了（多半卡在音频
+  /// 输出上），小窗因此定在某一帧。这个计数用来确认看门狗有没有真的出手。
+  private var statStallNudge = 0
+
+  /// 看门狗上一次采样到的播放位置与时刻（`-1` 表示尚未采样）。
+  private var stallWatchPosition: Double = -1
+  private var stallWatchAt: CFTimeInterval = 0
+
+  /// 上一次重推播放的时刻（限频用）。
+  private var lastStallNudge: CFTimeInterval = 0
+
+  /// 「已武装、后台里却没有任何小窗迹象」的起点时刻（`0` 表示未在等待）。
+  private var rebuildWaitSince: CFTimeInterval = 0
+
+  /// 控制器重建次数（6S 僵死窗口自愈用）。
+  private var statControllerRebuild = 0
+
   /// 补帧时 mpv 渲染没产出新画面的次数（轮转缓冲被占满等）。
   private var statRenderNil = 0
 
@@ -308,6 +328,11 @@ public class PictureInPicture: NSObject {
   @objc private func handleDidEnterBackground() {
     appIsBackground = true
     beginBackgroundSegment()
+    // 新的一段后台窗口期：看门狗与「重建等待」都从零开始。
+    stallWatchPosition = -1
+    stallWatchAt = 0
+    lastStallNudge = 0
+    rebuildWaitSince = 0
     guard isArmed else {
       return
     }
@@ -321,7 +346,11 @@ public class PictureInPicture: NSObject {
     // 小窗已经在显示时，系统会在切到后台的瞬间让图层暂停消化队列里的样本：队列
     // 看起来还是满的、`isReadyForMoreMediaData` 也可能一直不恢复，小窗就定在最后
     // 一帧。主动清一次队列并把时间轴拉回当前播放位置，让新帧从头开始进。
-    if isShowing {
+    //
+    // 这里原先只认 `isShowing`。6S 上系统自动建窗时既不送 didStart、controller
+    // 也一直报 inactive，`isShowing` 恒为 false —— 于是这段恢复一次都没跑过，
+    // 图层从切后台那一刻起就卡住。已武装就一律恢复。
+    if isShowing || isArmed {
       let layer = displayLayer
       let timebase = controlTimebase
       let resumeAt = mpvPosition()
@@ -347,6 +376,10 @@ public class PictureInPicture: NSObject {
     appIsBackground = false
     endBackgroundSegment()
     endBackgroundTaskIfNeeded()
+    stallWatchPosition = -1
+    stallWatchAt = 0
+    lastStallNudge = 0
+    rebuildWaitSince = 0
   }
 
   /// 申请一个后台续命任务（约 30 秒，够系统把画中画窗口建起来）。
@@ -921,6 +954,12 @@ public class PictureInPicture: NSObject {
     statStartFail = 0
     statSameFrame = 0
     hasFrameSignature = false
+    statStallNudge = 0
+    statControllerRebuild = 0
+    stallWatchPosition = -1
+    stallWatchAt = 0
+    lastStallNudge = 0
+    rebuildWaitSince = 0
   }
 
   /// 开始记录一段「后台窗口期」。
@@ -1113,6 +1152,10 @@ public class PictureInPicture: NSObject {
       "startCalls": statStartCalls,
       "startFail": statStartFail,
       "sameFrame": statSameFrame,
+      "stallNudge": statStallNudge,
+      "controllerRebuild": statControllerRebuild,
+      "layerDetached": layer.superlayer != nil
+        && layer.superlayer !== hostView.layer,
       "bgSeconds": segment.seconds,
       "bgEnqueuedDelta": segment.enqueued,
       "bgSameFrameDelta": segment.sameFrame,
@@ -1216,6 +1259,26 @@ public class PictureInPicture: NSObject {
           self.reconcileShowingState()
         }
       }
+      // 后台解码看门狗：帧在送、`time-pos` 却不动，说明播放循环本身停住了。
+      // 每 2 秒确认一次进度是否真的在走，不动就主动把播放重新推起来。
+      if self.appIsBackground, !self.mpvFlag("pause") {
+        let tick = CACurrentMediaTime()
+        let position = self.mpvPosition()
+        if self.stallWatchPosition < 0
+          || position - self.stallWatchPosition > 0.25
+        {
+          self.stallWatchPosition = position
+          self.stallWatchAt = tick
+        } else if tick - self.stallWatchAt > 2.0,
+          tick - self.lastStallNudge > 3.0
+        {
+          self.lastStallNudge = tick
+          self.stallWatchPosition = position
+          self.stallWatchAt = tick
+          self.statStallNudge += 1
+          self.nudgePlayback()
+        }
+      }
       // 刚刚才送过一帧（20ms 内）说明渲染回调仍在正常工作，跳过。
       let now = CACurrentMediaTime()
       let gap = now - self.lastLayerEnqueueAt
@@ -1246,19 +1309,104 @@ public class PictureInPicture: NSObject {
       guard let self = self else { return }
       self.statReconcileTry += 1
       guard !self.isShowing else { return }
-      guard self.pipController?.isPictureInPictureActive == true else { return }
-      NSLog("PictureInPicture: recovered missing didStart callback")
-      self.statReconcileHit += 1
-      self.isArmed = true
-      self.isShowing = true
-      self.showingSince = CACurrentMediaTime()
-      self.lastPosition = -1
-      self.lastIdleEnqueue = 0
-      self.lastLayerEnqueueAt = CACurrentMediaTime()
-      self.activateAudioSession()
-      self.startKeepAlive()
-      self.onNeedFrame?(true)
+      let active = self.pipController?.isPictureInPictureActive == true
+      // 图层被系统收进小窗窗口后，父层就不再是我们的宿主视图。这比
+      // `isPictureInPictureActive` 更可信：6S 上系统自动建窗时，delegate 与
+      // controller 状态都可能停在 false，只有「图层搬了家」这件事一定为真。
+      let detached = self.displayLayer.superlayer != nil
+        && self.displayLayer.superlayer !== self.hostView.layer
+      if active || detached {
+        NSLog("PictureInPicture: recovered missing didStart callback")
+        self.statReconcileHit += 1
+        self.isArmed = true
+        self.isShowing = true
+        self.showingSince = CACurrentMediaTime()
+        self.rebuildWaitSince = 0
+        self.lastPosition = -1
+        self.lastIdleEnqueue = 0
+        self.lastLayerEnqueueAt = CACurrentMediaTime()
+        self.activateAudioSession()
+        self.startKeepAlive()
+        self.onNeedFrame?(true)
+        return
+      }
+      // 已武装、已在后台，系统却既不报 active、图层也没被收走：这次自动进小窗
+      // 根本没建起来（屏幕上留着的多半是上一次会话的僵死窗口，拿不到新帧）。
+      // 等 2 秒仍如此就主动换一套控制器与画面源。
+      guard self.appIsBackground else { return }
+      let now = CACurrentMediaTime()
+      if self.rebuildWaitSince == 0 {
+        self.rebuildWaitSince = now
+        return
+      }
+      if now - self.rebuildWaitSince < 2.0 { return }
+      self.rebuildWaitSince = now
+      self.rebuildController()
     }
+  }
+
+  /// 把「已经停住」的播放重新推起来（后台看门狗专用）。
+  ///
+  /// 依次做三件事，任意一件奏效即可恢复：
+  /// 1. 回主线程重新激活音频会话 —— 后台态下会话被系统降级后，音频输出会一直等
+  ///    一个不再被拉取的缓冲，播放循环就卡死在写音频这一步；
+  /// 2. 清图层并把时间轴对回当前进度 —— 图层侧卡住时这一步即可恢复；
+  /// 3. 显式清掉 `pause` 并做一次「原地 seek」 —— 后台被挂起后，唯一能从外部唤醒
+  ///    播放循环的动作。目标位置就是当前位置，用户看不到跳转。
+  private func nudgePlayback() {
+    NSLog("PictureInPicture: playback stalled in background, nudging")
+    DispatchQueue.main.async { [weak self] in
+      self?.activateAudioSession()
+    }
+    let resumeAt = mpvPosition()
+    let resumeRate: Double = mpvFlag("pause") ? 0 : 1
+    let layer = displayLayer
+    let timebase = controlTimebase
+    layerQueue.async {
+      layer.flush()
+      if #available(iOS 15.0, *), let timebase = timebase {
+        CMTimebaseSetTime(
+          timebase,
+          time: CMTime(seconds: resumeAt, preferredTimescale: 600)
+        )
+        if CMTimebaseGetRate(timebase) != resumeRate {
+          CMTimebaseSetRate(timebase, rate: resumeRate)
+        }
+      }
+    }
+    mpv_set_property_string(handle, "pause", "no")
+    mpv_command_string(
+      handle,
+      "seek \(String(format: "%.3f", resumeAt)) absolute+exact"
+    )
+    // 连推两次仍不动，多半是卡在音频输出上：重载一次 AO。旧版 mpv 没有这个
+    // 命令，只会返回错误，不影响后续重试。
+    if statStallNudge >= 2 {
+      mpv_command_string(handle, "ao-reload")
+    }
+    onNeedFrame?(true)
+  }
+
+  /// 重建控制器与画面源（后台僵死小窗自愈用）。
+  @available(iOS 15.0, *)
+  private func rebuildController() {
+    // 一段武装期内最多重建几次：避免「重建了也不生效」时反复折腾。
+    guard statControllerRebuild < 3 else { return }
+    statControllerRebuild += 1
+    NSLog("PictureInPicture: rebuilding controller for stale session")
+    pipController?.stopPictureInPicture()
+    pipController?.delegate = nil
+    pipController = nil
+    // 僵死窗口可能还攥着图层：强制摘回来，否则新 contentSource 指向的图层落在
+    // 别人的窗口里，画面照样出不来。
+    attachDisplayLayer(force: true)
+    guard let controller = _ensureController() else { return }
+    controller.canStartPictureInPictureAutomaticallyFromInline = true
+    if controller.isPictureInPicturePossible {
+      statStartCalls += 1
+      controller.startPictureInPicture()
+    }
+    onNeedFrame?(true)
   }
 
   /// 停止低速补帧通道。
@@ -1328,15 +1476,17 @@ public class PictureInPicture: NSObject {
   /// 之所以不直接挂在 window 图层最底层：那样会被 Flutter 视图完全遮挡，部分系统
   /// 版本会因此判定画面「不可见」，导致 `isPictureInPicturePossible` 恒为 false，
   /// 画中画按钮点了没有反应。
-  private func attachDisplayLayer() {
-    // 小窗显示期间图层归系统的画中画通道使用：这时候把它从当前父层摘下来再挂回
-    // 宿主视图，等于在系统正读这块图层时把它抽走，小窗会停在抽走前的最后一帧。
-    // 只有「图层根本没挂上」时才需要补挂。
-    // 后台态同样算「小窗在用」：自动进小窗时系统经常不送 didStart，`isShowing`
-    // 一直是 false；此时若无条件把图层挂回宿主视图，等于把它从小窗窗口里抢出来，
-    // 小窗当场定格在最后一帧。
-    if isShowing || appIsBackground, displayLayer.superlayer != nil,
-      displayLayer.superlayer !== hostView.layer
+  private func attachDisplayLayer(force: Bool = false) {
+    // 图层归系统的画中画通道使用时，把它从当前父层摘下来再挂回宿主视图，等于在
+    // 系统正读这块图层时把它抽走，小窗会停在抽走前的最后一帧。
+    //
+    // 这里原来只在 `isShowing || appIsBackground` 时挡这一下。6S 上系统自动建窗
+    // 时这两个标记都可能还是 false（delegate 不来、controller 报 inactive），图层
+    // 于是被抢回宿主视图，小窗从此再也不更新 —— 读数里「入队成功一直在涨、同帧
+    // 也不多」，但屏幕上就是不动。现在改为无条件：只要图层挂在别处，就不碰它。
+    // 只有重建控制器时（`force`）才需要强行收回来。
+    if !force, let superlayer = displayLayer.superlayer,
+      superlayer !== hostView.layer
     {
       return
     }
