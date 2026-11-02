@@ -284,6 +284,22 @@ public class PictureInPicture: NSObject {
   private var lastFrameSignature: UInt64 = 0
   private var hasFrameSignature = false
 
+  /// 因为「内容和上一帧完全一样」而主动跳过入队的次数。
+  ///
+  /// 后台补帧在画面停住时会把同一帧反复送进图层，图层每收一次就要重推一次
+  /// IOSurface —— 15pm 上那条红光 / 频闪就是这么来的。内容没变就不必再送。
+  private var statDuplicateSkip = 0
+
+  /// 送进小窗的帧要复制到自有缓冲池，不能直接把 GL 的轮转 IOSurface 交出去。
+  ///
+  /// `TextureHW` 只有三块轮转缓冲，mpv 每帧都往里写；而
+  /// `AVSampleBufferDisplayLayer` 是在系统进程里异步读的。直接把轮转缓冲交出去，
+  /// 图层读到的可能就是「正在被写」的那一块 —— 15pm 上表现为画面频闪 / 整片发红，
+  /// 6S 上表现为反复同一帧。复制一份到自有缓冲就彻底解耦。
+  private var framePool: CVPixelBufferPool?
+  private var framePoolWidth = 0
+  private var framePoolHeight = 0
+
   /// 「上一次后台窗口期」的汇总。卡帧只发生在这一段，而读数只能在回前台后取，
   /// 所以必须在这里把起点与基线记下来，否则面板永远是「小窗没在显示」。
   private var bgSegmentStart: CFTimeInterval = 0
@@ -368,6 +384,17 @@ public class PictureInPicture: NSObject {
         }
       }
     }
+    // `inactive` 只给了零点几秒，很多情况下那一刻 `isPictureInPicturePossible`
+    // 还是 false，前台那次启动就这么废了。真正进到后台时再补一次：此时后台续命
+    // 任务已经拿到，阶梯可以完整跑完 —— 这是 6S 上最后缺的那一环。
+    if #available(iOS 15.0, *), !isShowing {
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self, self.isArmed, !self.isShowing else { return }
+        self.startTries = 0
+        self.startDeadline = CACurrentMediaTime() + 6.0
+        self._attemptStart()
+      }
+    }
     // 立刻补一帧：后台切换的瞬间系统最容易把渲染回调掐掉。
     onNeedFrame?(true)
   }
@@ -429,6 +456,15 @@ public class PictureInPicture: NSObject {
     return pipController?.isPictureInPicturePossible ?? false
   }
 
+  /// 当前是否要求「等 GPU 把这一帧写完再取」。
+  ///
+  /// 只有小窗真的在用这块画面时才需要：前台正常播放走同步渲染会拖慢 6S。
+  /// `startDeadline > 0` 覆盖启动阶梯那几秒 —— 那几帧是系统判定「有没有内容」
+  /// 的依据，必须干净。
+  public var needsSynchronizedFrame: Bool {
+    return isArmed && (isShowing || appIsBackground || startDeadline > 0)
+  }
+
   // MARK: - 生命周期
 
   /// 立即进入系统画中画（用户点按播放器上的「画中画」按钮）。
@@ -455,12 +491,43 @@ public class PictureInPicture: NSObject {
     resetCumulative()
     hostSide = lastGoodHostSide
     startTries = 0
-    startDeadline = CACurrentMediaTime() + 3.0
+    // 3 秒不够。`inactive` 到真正进后台之间只有零点几秒，系统一冻住主队列，
+    // 原来的重试阶梯就永远走不完（6S 读数里「前台进小窗 N 次 / 启动调用 0」）。
+    // 现在先把后台续命任务拿到手，阶梯拉长到 8 秒 —— 续命期内主队列还在跑，
+    // 足够等到 `isPictureInPicturePossible` 变真。
+    startDeadline = CACurrentMediaTime() + 8.0
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
+      // 这四步以前要等第一次 `_attemptStart` 才做，而那时可能已经在后台了。
+      // 提到最前面：音频会话、续命任务、补帧通道、画面源一次到位。
+      self.activateAudioSession()
+      self.beginBackgroundTaskIfNeeded()
+      self.attachDisplayLayer()
+      self.onNeedFrame?(true)
+      self.startKeepAlive()
       self._attemptStart()
     }
   }
+
+  /// 安排下一次启动尝试。
+  ///
+  /// 不能用 `DispatchQueue.main.asyncAfter`：App 已经在往后台走的时候主队列会被
+  /// 系统冻住，那个 block 永远不执行 —— 6S 上「前台进小窗 2 次、启动调用 0」
+  /// 就是这么来的。改投一条独立串行队列，到点再回主线程执行。
+  @available(iOS 15.0, *)
+  private func scheduleStartRetry() {
+    PictureInPicture.startRetryQueue.asyncAfter(deadline: .now() + 0.35) {
+      [weak self] in
+      guard let self = self else { return }
+      DispatchQueue.main.async {
+        self._attemptStart()
+      }
+    }
+  }
+
+  private static let startRetryQueue = DispatchQueue(
+    label: "media_kit.pip.start-retry"
+  )
 
   /// 单次启动尝试；条件不成立则在阶梯时限内续期重试。必须在主线程调用。
   @available(iOS 15.0, *)
@@ -506,10 +573,7 @@ public class PictureInPicture: NSObject {
     }
 
     if CACurrentMediaTime() < startDeadline {
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-        guard let self = self else { return }
-        self._attemptStart()
-      }
+      scheduleStartRetry()
       return
     }
 
@@ -521,6 +585,9 @@ public class PictureInPicture: NSObject {
     )
     hostSide = lastGoodHostSide
     attachDisplayLayer()
+    // 手动这条路没走通：把「切后台时由系统自己弹窗」重新打开当兜底。
+    // 两条路都留着，总比屏幕上什么都没有强。
+    pipController?.canStartPictureInPictureAutomaticallyFromInline = true
   }
 
   /// 「武装」自动画中画：不立即弹出窗口，而是在用户划回主屏幕（App 进入后台）时
@@ -681,7 +748,11 @@ public class PictureInPicture: NSObject {
   ///
   /// - Parameter force: 绕过「小窗未显示时降频」的限制，供启动阶段主动补帧使用。
   ///   图层里有没有画面会直接影响系统对画中画可用性的判定，这一帧不能省。
-  public func enqueue(_ pixelBuffer: CVPixelBuffer, force: Bool = false) {
+  public func enqueue(
+    _ pixelBuffer: CVPixelBuffer,
+    force: Bool = false,
+    synchronized: Bool = false
+  ) {
     guard #available(iOS 15.0, *) else {
       return
     }
@@ -773,7 +844,14 @@ public class PictureInPicture: NSObject {
     // 6000 条），而源帧取自 OpenGL 纹理缓存，还要对它 `CVPixelBufferLockBaseAddress`。
     // 播放中这条路径每一帧都在跑，长时间播放会把 CPU 与内存带宽推满——现象即小窗卡死，
     // 随后整个进程连新建网络连接都失败。该功能已按用户要求整体移除，小窗只显示画面本身。
+    // 与 GL 轮转缓冲解耦：复制一份自有缓冲再入队。
+    //
+    // 只有调用方确认「这一帧已经写完」（`renderSynchronized`）时才敢复制，
+    // 否则锁住的是 GPU 正在写的内存。
     var frame = pixelBuffer
+    if synchronized, let copied = copyFrame(pixelBuffer) {
+      frame = copied
+    }
     // 诊断叠加层：开机时把读数自身画进小窗。小窗里看得到这些字，就说明帧确实送到了
     // 图层，黑屏发生在「系统把图层内容接进小窗」那一环；一片纯黑连字也没有，则说明
     // 帧压根没送进去。这是零成本区分两类成因的办法（仅诊断时开启）。
@@ -840,11 +918,18 @@ public class PictureInPicture: NSObject {
     // 只在后台窗口期取样：那时补帧走同步渲染（`renderSynchronized`），缓冲已经写完，
     // 锁基地址是安全的。前台正常播放不取样——GPU 可能还在写这块缓冲，锁它既没有
     // 意义，还可能反过来拖慢渲染。
-    if appIsBackground {
+    if appIsBackground, synchronized {
       let signature = frameSignature(pixelBuffer)
       if signature != 0 {
         if hasFrameSignature, signature == lastFrameSignature {
           statSameFrame += 1
+          // 内容完全没变：再送一次只会让图层重推同一块 IOSurface。
+          // 15pm 上的红光 / 频闪就是这么被放大出来的。除非是强制补帧
+          // （刚清过队列、必须立刻有画面），否则直接跳过。
+          if !force {
+            statDuplicateSkip += 1
+            return
+          }
         }
         lastFrameSignature = signature
         hasFrameSignature = true
@@ -953,6 +1038,7 @@ public class PictureInPicture: NSObject {
     statStartCalls = 0
     statStartFail = 0
     statSameFrame = 0
+    statDuplicateSkip = 0
     hasFrameSignature = false
     statStallNudge = 0
     statControllerRebuild = 0
@@ -1152,6 +1238,7 @@ public class PictureInPicture: NSObject {
       "startCalls": statStartCalls,
       "startFail": statStartFail,
       "sameFrame": statSameFrame,
+      "duplicateSkip": statDuplicateSkip,
       "stallNudge": statStallNudge,
       "controllerRebuild": statControllerRebuild,
       "layerDetached": layer.superlayer != nil
@@ -1450,7 +1537,12 @@ public class PictureInPicture: NSObject {
     // 每帧都强行对时，图层的呈现时钟一直在抖：6S 这类老机器上表现为
     // 「声音在走、画面不动」。只有明显跑偏（seek / 换源 / 卡顿后追帧）才校正。
     let current = CMTimebaseGetTime(timebase).seconds
-    if !current.isFinite || abs(current - position) > 0.3 {
+    // 只许往前推。旧实现按「差值超过 0.3 秒」双向校正，而 mpv 的 time-pos 是
+    // 0.1 秒粒度、偶尔还会回退一点，于是时间轴被反复往回设：图层去等一个已经
+    // 播过的时刻，小窗就定在那一帧（6S），或者干脆闪成一片红（15pm 上图层在
+    // 时间轴抖动时会重推 IOSurface）。往前追帧用 1 秒阈值，真回退（seek / 换源）
+    // 用 3 秒阈值区分。
+    if !current.isFinite || position > current + 1.0 || position < current - 3.0 {
       CMTimebaseSetTime(
         timebase,
         time: CMTime(seconds: position, preferredTimescale: 600)
@@ -1520,6 +1612,75 @@ public class PictureInPicture: NSObject {
       displayLayer.removeFromSuperlayer()
       hostView.layer.addSublayer(displayLayer)
     }
+  }
+
+  /// 把一帧复制到自有缓冲池。必须在 `renderSynchronized` 之后调用。
+  private func copyFrame(_ source: CVPixelBuffer) -> CVPixelBuffer? {
+    let width = CVPixelBufferGetWidth(source)
+    let height = CVPixelBufferGetHeight(source)
+    if width <= 0 || height <= 0 {
+      return nil
+    }
+    if framePool == nil || framePoolWidth != width || framePoolHeight != height {
+      framePool = nil
+      framePoolWidth = width
+      framePoolHeight = height
+      let attributes: [String: Any] = [
+        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+        kCVPixelBufferWidthKey as String: width,
+        kCVPixelBufferHeightKey as String: height,
+        kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
+        kCVPixelBufferMetalCompatibilityKey as String: true,
+      ]
+      var pool: CVPixelBufferPool?
+      CVPixelBufferPoolCreate(
+        kCFAllocatorDefault,
+        nil,
+        attributes as CFDictionary,
+        &pool
+      )
+      framePool = pool
+    }
+    guard let pool = framePool else { return nil }
+    var destination: CVPixelBuffer?
+    // 给池子设一个存活上限：图层卡住时样本会一直攥着缓冲不放，6S 内存小，
+    // 宁可退回「直接交轮转缓冲」（可能偶发一帧不干净）也不能把内存吃穿。
+    let aux: [String: Any] = [
+      kCVPixelBufferPoolAllocationThresholdKey as String: 8
+    ]
+    guard
+      CVPixelBufferPoolCreatePixelBufferWithAuxiliaryAttributes(
+        kCFAllocatorDefault,
+        pool,
+        aux as CFDictionary,
+        &destination
+      ) == kCVReturnSuccess,
+      let dest = destination
+    else {
+      return nil
+    }
+    guard CVPixelBufferLockBaseAddress(source, .readOnly) == kCVReturnSuccess
+    else { return nil }
+    defer { CVPixelBufferUnlockBaseAddress(source, .readOnly) }
+    guard CVPixelBufferLockBaseAddress(dest, []) == kCVReturnSuccess else {
+      return nil
+    }
+    defer { CVPixelBufferUnlockBaseAddress(dest, []) }
+    guard
+      let sourceBase = CVPixelBufferGetBaseAddress(source),
+      let destBase = CVPixelBufferGetBaseAddress(dest)
+    else { return nil }
+    let sourceStride = CVPixelBufferGetBytesPerRow(source)
+    let destStride = CVPixelBufferGetBytesPerRow(dest)
+    let rowBytes = Swift.min(sourceStride, destStride)
+    for row in 0..<height {
+      memcpy(
+        destBase + row * destStride,
+        sourceBase + row * sourceStride,
+        rowBytes
+      )
+    }
+    return dest
   }
 
   private func emitError(_ message: String) {

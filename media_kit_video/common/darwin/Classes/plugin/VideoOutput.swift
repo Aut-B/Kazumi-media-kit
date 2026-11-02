@@ -359,9 +359,14 @@ public class VideoOutput: NSObject {
       return
     }
 
+    // 小窗在用这块画面时必须等 GPU 写完再取：`copyPixelBuffer()` 交出去的
+    // IOSurface 会被系统进程异步读，而 `glFlush()` 只提交命令、不保证写完。
+    // 前台正常播放不走同步渲染（会拖慢 6S），只在「小窗已显示 / App 在后台 /
+    // 启动阶梯进行中」时同步。
+    var pipSynchronized = false
     #if os(iOS)
-      // 后台态下这条路径也在给小窗供帧：必须等这一帧写完再取，否则取到的是上一帧。
-      if pip?.isAppBackground == true {
+      pipSynchronized = pip?.needsSynchronizedFrame == true
+      if pipSynchronized {
         texture.renderSynchronized(size)
       } else {
         texture.render(size)
@@ -375,7 +380,7 @@ public class VideoOutput: NSObject {
       // 产生不少临时对象。渲染回调跑在媒体线程上，不能指望它自带自动释放池，这里补一层，
       // 免得这些对象一路挂到进程结束（长时间播放会越积越多）。
       autoreleasepool {
-        feedPictureInPicture()
+        feedPictureInPicture(synchronized: pipSynchronized)
       }
 
     #endif
@@ -416,13 +421,16 @@ public class VideoOutput: NSObject {
         // 「上一帧」送给小窗（6S 上表现为反复播放同一帧）。
         texture.renderSynchronized(size)
       }
-      feedPictureInPicture(force: force)
+      feedPictureInPicture(force: force, synchronized: true)
     }
 
     /// 把最新渲染完成的一帧喂给画中画图层。
     ///
     /// - Parameter force: 绕过「小窗未显示时降频」的限制，用于启动阶段主动补帧。
-    private func feedPictureInPicture(force: Bool = false) {
+    private func feedPictureInPicture(
+      force: Bool = false,
+      synchronized: Bool = false
+    ) {
       guard let pip = pip, pip.isArmed else {
         return
       }
@@ -433,7 +441,7 @@ public class VideoOutput: NSObject {
         pip.noteCopyNil()
         return
       }
-      pip.enqueue(pixelBuffer, force: force)
+      pip.enqueue(pixelBuffer, force: force, synchronized: synchronized)
     }
   #endif
 
