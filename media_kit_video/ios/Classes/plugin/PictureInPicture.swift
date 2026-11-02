@@ -1510,22 +1510,18 @@ public class PictureInPicture: NSObject {
   /// 建立画面图层的时间轴（只做一次）。
   @available(iOS 15.0, *)
   private func setupTimebase() {
-    if controlTimebase != nil {
-      return
-    }
-    var timebase: CMTimebase?
-    let status = CMTimebaseCreateWithSourceClock(
-      allocator: kCFAllocatorDefault,
-      sourceClock: CMClockGetHostTimeClock(),
-      timebaseOut: &timebase
-    )
-    guard status == noErr, let timebase = timebase else {
-      NSLog("PictureInPicture: CMTimebaseCreateWithSourceClock failed: \(status)")
-      return
-    }
-    CMTimebaseSetRate(timebase, rate: 1.0)
-    displayLayer.controlTimebase = timebase
-    controlTimebase = timebase
+    // 不再给图层挂时间轴。
+    //
+    // 挂上 `controlTimebase` 之后，图层是按「时间轴时刻 == 样本 PTS」排片的：
+    // 时间轴被 mpv 的 time-pos 牵着走（0.1 秒粒度，还会轻微回退），只要某一刻
+    // 时间轴落到了样本 PTS 之后，这一帧就被判成「已经过期」丢掉；连着丢几帧，
+    // 小窗就停在上一次成功显示的那一帧 —— 读数正是「入队一直在涨、同帧不多、
+    // 画面不动」。6S 上还叠加了「后台主队列被冻死」，我们连纠偏都做不到。
+    //
+    // 现在让图层不持时间轴：样本一入队就按到达顺序立刻显示（等同直播流）。
+    // 画中画的进度条 / 快进由 `AVPictureInPictureSampleBufferPlaybackDelegate`
+    // 提供，不依赖图层时间轴。
+    controlTimebase = nil
   }
 
   /// 把小窗时间轴校准到当前播放位置，并同步播放 / 暂停状态。
