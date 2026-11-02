@@ -271,6 +271,10 @@ public class PictureInPicture: NSObject {
   private var statDidStop = 0
   private var statReconcileTry = 0
   private var statReconcileHit = 0
+  /// 前台预热次数 / 其中「系统认可可进小窗」的次数。
+  private var statPrewarm = 0
+  private var statPrewarmOk = 0
+  private var lastPrewarm: CFTimeInterval = 0
   private var statBgEnqueued = 0
   private var statFgEnqueued = 0
   private var statStartCalls = 0
@@ -388,12 +392,10 @@ public class PictureInPicture: NSObject {
     // 还是 false，前台那次启动就这么废了。真正进到后台时再补一次：此时后台续命
     // 任务已经拿到，阶梯可以完整跑完 —— 这是 6S 上最后缺的那一环。
     if #available(iOS 15.0, *), !isShowing {
-      DispatchQueue.main.async { [weak self] in
-        guard let self = self, self.isArmed, !self.isShowing else { return }
-        self.startTries = 0
-        self.startDeadline = CACurrentMediaTime() + 6.0
-        self._attemptStart()
-      }
+      // 同一轮 runloop 内直接启动。这里原来是 `DispatchQueue.main.async`，而 6S
+      // 上主队列在 `didEnterBackground` 之后就不再被调度 —— 那个 block 一次都
+      // 没跑过（build 34 / 35 读数：`后台启动调用 0`、`校正尝试 0`）。
+      _startImmediately()
     }
     // 立刻补一帧：后台切换的瞬间系统最容易把渲染回调掐掉。
     onNeedFrame?(true)
@@ -407,6 +409,14 @@ public class PictureInPicture: NSObject {
     stallWatchAt = 0
     lastStallNudge = 0
     rebuildWaitSince = 0
+    // 从小窗 / 后台回来时，图层可能停在「等 PTS」或「解码待刷新」的状态，App 里
+    // 那块画面就定格在最后一帧。清一次队列并立刻补一帧。
+    if !isShowing {
+      let layer = displayLayer
+      layerQueue.async { layer.flush() }
+      lastLayerEnqueueAt = 0
+      onNeedFrame?(true)
+    }
   }
 
   /// 申请一个后台续命任务（约 30 秒，够系统把画中画窗口建起来）。
@@ -496,16 +506,68 @@ public class PictureInPicture: NSObject {
     // 现在先把后台续命任务拿到手，阶梯拉长到 8 秒 —— 续命期内主队列还在跑，
     // 足够等到 `isPictureInPicturePossible` 变真。
     startDeadline = CACurrentMediaTime() + 8.0
+    // 直接在本轮 runloop 里启动，不再 `DispatchQueue.main.async` 一跳。
+    //
+    // build 35 读数：`didStart/Stop 1/1`（窗确实开过）但 `图层被接管 否`、
+    // `后台同帧 1` —— 系统没拿我们的图层，窗里是建窗那一刻的快照。根因是启动
+    // 发生在 App 已经开始过渡之后：异步跳回来时图层已被判「不可见」，
+    // AVKit 只能拿最后一次快照建窗，于是画面永远定住。
+    activateAudioSession()
+    beginBackgroundTaskIfNeeded()
+    attachDisplayLayer()
+    onNeedFrame?(true)
+    startKeepAlive()
+    _startImmediately()
+  }
+
+  /// 立刻启动画中画：不做 `isPictureInPicturePossible` 预判。
+  ///
+  /// 那个属性只是「预测」。App 正在切后台的那几百毫秒里它常常还是 false，而等它
+  /// 变真时主队列已经冻住，重试永远跑不到（build 34 / 35 读数：`后台启动调用 0`）。
+  /// 这里直接调 `startPictureInPicture()`：能起就起，起不来系统静默忽略，
+  /// 我们再退回阶梯兜底。
+  @available(iOS 15.0, *)
+  private func _startImmediately() {
+    guard isArmed, !isShowing else { return }
+    guard let controller = _ensureController() else { return }
+    controller.canStartPictureInPictureAutomaticallyFromInline = true
+    possibleCache = controller.isPictureInPicturePossible
+    if controller.isPictureInPictureActive {
+      startDeadline = 0
+      return
+    }
+    statStartCalls += 1
+    startTries = 0
+    startDeadline = CACurrentMediaTime() + 6.0
+    controller.startPictureInPicture()
+    // 起不来时退回阶梯。阶梯依赖主队列，只在还没被冻住时有效，属于兜底。
+    scheduleStartRetry()
+  }
+
+  /// 前台预热：把图层养到「系统认可可进小窗」的状态。
+  ///
+  /// 宿主视图默认只有 2 点见方。AVKit 判定画面源是否可用时，尺寸与可见性是主要
+  /// 依据：2 点的图层在 6S 上等不到 `isPictureInPicturePossible == true`，于是切
+  /// 后台那一下根本无窗可开。这里按 24 → 64 点逐档放大（不透明度仍是最低的
+  /// 0.02，屏幕上几乎看不出来），直到系统点头为止。
+  private func prewarmPossible() {
     DispatchQueue.main.async { [weak self] in
-      guard let self = self else { return }
-      // 这四步以前要等第一次 `_attemptStart` 才做，而那时可能已经在后台了。
-      // 提到最前面：音频会话、续命任务、补帧通道、画面源一次到位。
-      self.activateAudioSession()
-      self.beginBackgroundTaskIfNeeded()
+      guard let self = self, self.isArmed, !self.isShowing else { return }
+      guard let controller = self.pipController else { return }
+      self.statPrewarm += 1
+      let possible = controller.isPictureInPicturePossible
+      self.possibleCache = possible
+      if possible {
+        self.statPrewarmOk += 1
+        return
+      }
+      if self.hostSide < 24 {
+        self.hostSide = 24
+      } else if self.hostSide < 64 {
+        self.hostSide = 64
+      }
       self.attachDisplayLayer()
       self.onNeedFrame?(true)
-      self.startKeepAlive()
-      self._attemptStart()
     }
   }
 
@@ -1033,6 +1095,9 @@ public class PictureInPicture: NSObject {
     statDidStop = 0
     statReconcileTry = 0
     statReconcileHit = 0
+    statPrewarm = 0
+    statPrewarmOk = 0
+    lastPrewarm = 0
     statBgEnqueued = 0
     statFgEnqueued = 0
     statStartCalls = 0
@@ -1233,6 +1298,8 @@ public class PictureInPicture: NSObject {
       "didStop": statDidStop,
       "reconcileTry": statReconcileTry,
       "reconcileHit": statReconcileHit,
+      "prewarm": statPrewarm,
+      "prewarmOk": statPrewarmOk,
       "bgEnqueued": statBgEnqueued,
       "fgEnqueued": statFgEnqueued,
       "startCalls": statStartCalls,
@@ -1331,9 +1398,18 @@ public class PictureInPicture: NSObject {
       guard let self = self, self.isArmed else {
         return
       }
-      // 前台且小窗未显示时完全不插手：那时渲染回调一定在供帧。
+      // 前台且小窗未显示时不插手供帧（那时渲染回调一定在供帧），但要做一件事：
+      // 每秒确认一次「系统是否认可这块画面源可进小窗」，不认可就把宿主放大一档。
+      //
+      // 这一步必须在**前台**做完。6S 的读数证明 `didEnterBackground` 之后主队列
+      // 就不再被调度，切后台那一刻再去等图层就绪，等来的只有定帧。
       if !self.isShowing, !self.appIsBackground {
         self.statKeepAliveSkipped += 1
+        let now = CACurrentMediaTime()
+        if now - self.lastPrewarm > 1.0 {
+          self.lastPrewarm = now
+          self.prewarmPossible()
+        }
         return
       }
       // 系统有时不会把「已进入画中画」的 delegate 回调送过来，`isShowing` 于是
@@ -1806,7 +1882,18 @@ extension PictureInPicture: AVPictureInPictureControllerDelegate {
     isShowing = false
     showingSince = 0
     lastReconcile = 0
-    stopKeepAlive()
+    // 启动阶段为了「让系统判定可用」把宿主放大并提亮过，收起小窗后要还原，
+    // 否则 App 里会一直留着一块小画面。
+    hostSide = lastGoodHostSide
+    hostView.alpha = PictureInPicture.hostIdleAlpha
+    attachDisplayLayer()
+    // 仍然武装着就继续跑保活：前台预热靠它把「可启动」状态一直养着，
+    // 下一次切后台才不用等。它在正常播放时只做一秒一次的判定，几乎不耗电。
+    if isArmed {
+      startKeepAlive()
+    } else {
+      stopKeepAlive()
+    }
     endBackgroundTaskIfNeeded()
     eventCallback("VideoOutput.PictureInPictureStateChanged", ["active": false])
   }
