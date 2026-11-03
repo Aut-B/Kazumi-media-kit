@@ -261,6 +261,12 @@ public class PictureInPicture: NSObject {
   /// 最近一次「恢复冲洗」的时刻，用于限制冲洗频率。
   private var lastResumeFlush: CFTimeInterval = 0
 
+  /// 因播放位置倒退（换源 / 循环回 0）而清屏的次数。
+  private var statPositionFlush = 0
+
+  /// 最近一次因位置倒退清屏的时刻，用于限制清屏频率。
+  private var lastPositionFlush: CFTimeInterval = 0
+
   // MARK: - 累计计数（不随单次启动清零）
   //
   // 面板读数只能在回到前台之后读：那时 `showing` 必然为 false，单次计数又已被
@@ -413,7 +419,11 @@ public class PictureInPicture: NSObject {
     // 那块画面就定格在最后一帧。清一次队列并立刻补一帧。
     if !isShowing {
       let layer = displayLayer
-      layerQueue.async { layer.flush() }
+      // 图层仍在正常渲染时不要清屏：每清一次画面都会黑一下再出新帧，回前台
+      // 那一下就会变成一次可见的闪。
+      if layer.status != .rendering {
+        layerQueue.async { layer.flush() }
+      }
       lastLayerEnqueueAt = 0
       onNeedFrame?(true)
     }
@@ -845,7 +855,7 @@ public class PictureInPicture: NSObject {
         if isShowing || appIsBackground {
           if notReadySince == 0 {
             notReadySince = now
-          } else if now - notReadySince > 1.0, now - lastStuckFlush > 2.0 {
+          } else if now - notReadySince > 1.0, now - lastStuckFlush > 3.0 {
             lastStuckFlush = now
             notReadySince = 0
             NSLog("PictureInPicture: layer stuck, flushing")
@@ -890,8 +900,15 @@ public class PictureInPicture: NSObject {
 
     // 当前播放位置：既用于校准小窗进度条，也用于确定这一帧该显示哪些弹幕。
     let position = mpvPosition()
-    if lastPosition >= 0, position < lastPosition - 1 {
-      // 播放位置大幅倒退说明换了视频源；时间轴倒退会让图层停止消化后续样本。
+    // 位置倒退说明换了视频源；但单曲循环回到 0 也会命中，而每清一次屏画面就
+    // 闪一下——长时间播放后「看多了就频闪 / 红屏」正是这么累积出来的。
+    // 因此要求倒退超过 2 秒，且两次清屏至少间隔 2 秒。
+    let positionNow = CACurrentMediaTime()
+    if lastPosition >= 0, position < lastPosition - 2,
+      positionNow - lastPositionFlush > 2.0
+    {
+      lastPositionFlush = positionNow
+      statPositionFlush += 1
       layerQueue.async {
         layer.flush()
       }
@@ -1011,8 +1028,12 @@ public class PictureInPicture: NSObject {
       // 注意：这条队列**不是**主队列。App 退到后台后主队列会被系统降频，样本就再也
       // 进不了图层；`AVSampleBufferDisplayLayer` 只要求调用串行，并不要求主线程。
       let now = CACurrentMediaTime()
+      // 小窗已经在显示时不要频繁冲洗：每冲一次画面就闪一下，长时间播放就
+      // 变成「频闪 / 红屏」。显示中把间隔放宽到 4 秒，未显示（预热、建窗
+      // 窗口期）时 1.5 秒，仍然能保证图层不会因为拒收样本而永久黑屏。
+      let flushGap: CFTimeInterval = self.isShowing ? 4.0 : 1.5
       let resumeFlush =
-        layer.requiresFlushToResumeDecoding && now - self.lastResumeFlush > 0.2
+        layer.requiresFlushToResumeDecoding && now - self.lastResumeFlush > flushGap
       if layer.status == .failed
         || resumeFlush
         || (force && !layer.isReadyForMoreMediaData)
@@ -1206,9 +1227,11 @@ public class PictureInPicture: NSObject {
     statTimerTicks = 0
     statKeepAliveSkipped = 0
     statResumeFlush = 0
+    statPositionFlush = 0
     notReadySince = 0
     lastStuckFlush = 0
     lastResumeFlush = 0
+    lastPositionFlush = 0
     // 后台窗口期内（自动进小窗时 `didStart` 会调到这里）清零单次计数，
     // 基线要跟着挪，否则「后台入队」会算成负数。
     if bgSegmentStart > 0 {
@@ -1229,7 +1252,7 @@ public class PictureInPicture: NSObject {
     let size = "\(CVPixelBufferGetWidth(frame))x\(CVPixelBufferGetHeight(frame))"
     return [
       "帧入图层 \(statEnqueued)/\(statAttempt)",
-      "拒收 \(statNotReady) · 恢复冲洗 \(statResumeFlush) · 就绪 \(layer.isReadyForMoreMediaData ? 1 : 0)",
+      "拒收 \(statNotReady) · 冲洗 \(statResumeFlush)/\(statPositionFlush) · 就绪 \(layer.isReadyForMoreMediaData ? 1 : 0)",
       "小窗 \(isShowing ? 1 : 0) · 武装 \(isArmed ? 1 : 0) · 可画 \(possibleCache ? 1 : 0) · 声 \(audioSessionActive ? 1 : 0)/\(audioOtherPlaying ? 1 : 0)",
       "保活 \(statTimerTicks)/\(statStallRecover) · 空转 \(statRenderNil) · \(size)",
     ]
@@ -1294,6 +1317,7 @@ public class PictureInPicture: NSObject {
       "stallRecover": statStallRecover,
       "renderNil": statRenderNil,
       "resumeFlush": statResumeFlush,
+      "positionFlush": statPositionFlush,
       "didStart": statDidStart,
       "didStop": statDidStop,
       "reconcileTry": statReconcileTry,
