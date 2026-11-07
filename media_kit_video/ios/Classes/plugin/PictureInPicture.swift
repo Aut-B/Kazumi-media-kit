@@ -220,6 +220,15 @@ public class PictureInPicture: NSObject {
   /// 保活通道发现「图层长时间没有新样本」并强制补帧的次数。
   private var statStallRecover = 0
 
+  /// 其中「小窗正在显示」时补的帧数。
+  ///
+  /// build 38 新增：显示中补帧走 `force = true`，会绕过「同帧跳过」，把同一块
+  /// IOSurface 反复重推给图层 —— 这是 15pm「看多了就闪」的头号嫌疑。
+  private var statStallShown = 0
+
+  /// 其中「小窗未显示」时补的帧数（启动 / 预热阶段，属正常）。
+  private var statStallIdle = 0
+
   /// 后台「进度不走」看门狗主动重推播放的次数（诊断用）。
   ///
   /// 15pm 上出现过一种与 6S 完全不同的卡法：帧以 30fps 稳定送进图层、内容甚至还在
@@ -299,6 +308,18 @@ public class PictureInPicture: NSObject {
   /// 后台补帧在画面停住时会把同一帧反复送进图层，图层每收一次就要重推一次
   /// IOSurface —— 15pm 上那条红光 / 频闪就是这么来的。内容没变就不必再送。
   private var statDuplicateSkip = 0
+
+  /// 小窗显示期间「内容和上一帧完全一样」的次数。
+  ///
+  /// 原先只在后台取样，前台小窗里闪的时候这个计数器一次都不跳 —— 面板看起来
+  /// 什么问题都没有。这就是「诊断什么都查不出来」的盲区。
+  private var statSameFrameShown = 0
+
+  /// 小窗显示期间图层被清空的次数（任何来源）。每清一次就闪一下。
+  private var statFlushShown = 0
+
+  /// 最近一次清空图层的时刻：刚清过就必须重推一帧，否则小窗会空着。
+  private var lastLayerFlushAt: CFTimeInterval = 0
 
   /// 送进小窗的帧要复制到自有缓冲池，不能直接把 GL 的轮转 IOSurface 交出去。
   ///
@@ -381,6 +402,7 @@ public class PictureInPicture: NSObject {
       let timebase = controlTimebase
       let resumeAt = mpvPosition()
       let resumeRate: Double = mpvFlag("pause") ? 0 : 1
+      noteLayerFlush()
       layerQueue.async {
         layer.flush()
         if #available(iOS 15.0, *), let timebase = timebase {
@@ -422,6 +444,7 @@ public class PictureInPicture: NSObject {
       // 图层仍在正常渲染时不要清屏：每清一次画面都会黑一下再出新帧，回前台
       // 那一下就会变成一次可见的闪。
       if layer.status != .rendering {
+        noteLayerFlush()
         layerQueue.async { layer.flush() }
       }
       lastLayerEnqueueAt = 0
@@ -630,6 +653,7 @@ public class PictureInPicture: NSObject {
     // 图层状态异常时清掉，并补一帧最新画面。
     attachDisplayLayer()
     if displayLayer.status == .failed {
+      noteLayerFlush()
       displayLayer.flush()
     }
     onNeedFrame?(true)
@@ -641,6 +665,15 @@ public class PictureInPicture: NSObject {
       // 与放大同步把不透明度提回来：万一「近乎全透明」在个别机型上被判成
       // 「画面源不可见」，这一步就是兜底。小窗弹出后 [didStart] 会立刻降回去。
       hostView.alpha = 1
+      // build 38：这一档只是「兜底提亮」。启动最终没成功（`didStart` 不来）时，
+      // 这块 24/64 点的不透明方块会一直留在屏幕正中，看起来就是一块亮斑 / 红光。
+      // 2 秒后无条件降回常态透明度。
+      DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+        guard let self = self else { return }
+        if !self.isShowing {
+          self.hostView.alpha = PictureInPicture.hostIdleAlpha
+        }
+      }
       attachDisplayLayer()
     }
 
@@ -744,6 +777,7 @@ public class PictureInPicture: NSObject {
 
     let layer = displayLayer
     let timebase = controlTimebase
+    noteLayerFlush()
     // 与 `enqueue` 投同一条串行队列：既保证「先清空、再入队新视频的帧」这个顺序，
     // 也让切集不再依赖主线程 —— App 停在小窗里连续播放时，主线程随时可能被降频，
     // 一旦这一步跑不到，新视频的帧就会顶在上一集的时间轴上，小窗随即变黑。
@@ -865,6 +899,7 @@ public class PictureInPicture: NSObject {
             let resumeRate: Double = mpvFlag("pause") ? 0 : 1
             layerQueue.async { [weak self] in
               layer.flush()
+              self?.noteLayerFlush()
               if #available(iOS 15.0, *), let timebase = self?.controlTimebase {
                 CMTimebaseSetTime(
                   timebase,
@@ -909,6 +944,7 @@ public class PictureInPicture: NSObject {
     {
       lastPositionFlush = positionNow
       statPositionFlush += 1
+      noteLayerFlush()
       layerQueue.async {
         layer.flush()
       }
@@ -994,18 +1030,24 @@ public class PictureInPicture: NSObject {
     // 「画面不换」有两种完全不同的成因：渲染出来就是同一帧，或者内容在变但图层
     // 没显示。入队前算一次内容签名，就能把两者分开。
     //
-    // 只在后台窗口期取样：那时补帧走同步渲染（`renderSynchronized`），缓冲已经写完，
-    // 锁基地址是安全的。前台正常播放不取样——GPU 可能还在写这块缓冲，锁它既没有
-    // 意义，还可能反过来拖慢渲染。
-    if appIsBackground, synchronized {
+    // build 38：取样范围从「后台 + 同步」放宽到「同步」。
+    //
+    // `needsSynchronizedFrame` 在小窗显示期间恒为真，因此只要小窗在显示，每一帧
+    // 都走 `renderSynchronized` + `copyFrame`，缓冲已经写完，锁基地址是安全的。
+    // 原先只采后台，导致「前台小窗里闪」时计数器一次都不跳 —— 诊断的盲区就在这。
+    if synchronized {
       let signature = frameSignature(pixelBuffer)
       if signature != 0 {
         if hasFrameSignature, signature == lastFrameSignature {
           statSameFrame += 1
-          // 内容完全没变：再送一次只会让图层重推同一块 IOSurface。
-          // 15pm 上的红光 / 频闪就是这么被放大出来的。除非是强制补帧
-          // （刚清过队列、必须立刻有画面），否则直接跳过。
-          if !force {
+          if isShowing {
+            statSameFrameShown += 1
+          }
+          // 内容完全没变：再送一次只会让图层重推同一块 IOSurface，小窗里就是
+          // 一次可见的闪（15pm 上的红光 / 频闪）。build 38 起强制补帧也一并跳过，
+          // 唯一例外是「刚刚清空过图层」—— 那时必须重推一帧，否则小窗会空着。
+          // 这一条把补帧通道 30fps 的重推彻底掐掉。
+          if !force || CACurrentMediaTime() - lastLayerFlushAt > 0.5 {
             statDuplicateSkip += 1
             return
           }
@@ -1042,6 +1084,7 @@ public class PictureInPicture: NSObject {
           self.statResumeFlush += 1
         }
         self.lastResumeFlush = now
+        self.noteLayerFlush()
         layer.flush()
       }
       layer.enqueue(sampleBuffer)
@@ -1124,7 +1167,12 @@ public class PictureInPicture: NSObject {
     statStartCalls = 0
     statStartFail = 0
     statSameFrame = 0
+    statSameFrameShown = 0
     statDuplicateSkip = 0
+    statStallShown = 0
+    statStallIdle = 0
+    statFlushShown = 0
+    lastLayerFlushAt = 0
     hasFrameSignature = false
     statStallNudge = 0
     statControllerRebuild = 0
@@ -1252,9 +1300,10 @@ public class PictureInPicture: NSObject {
     let size = "\(CVPixelBufferGetWidth(frame))x\(CVPixelBufferGetHeight(frame))"
     return [
       "帧入图层 \(statEnqueued)/\(statAttempt)",
-      "拒收 \(statNotReady) · 冲洗 \(statResumeFlush)/\(statPositionFlush) · 就绪 \(layer.isReadyForMoreMediaData ? 1 : 0)",
+      "拒收 \(statNotReady) · 冲洗 \(statResumeFlush)/\(statPositionFlush)/\(statFlushShown) · 就绪 \(layer.isReadyForMoreMediaData ? 1 : 0)",
       "小窗 \(isShowing ? 1 : 0) · 武装 \(isArmed ? 1 : 0) · 可画 \(possibleCache ? 1 : 0) · 声 \(audioSessionActive ? 1 : 0)/\(audioOtherPlaying ? 1 : 0)",
-      "保活 \(statTimerTicks)/\(statStallRecover) · 空转 \(statRenderNil) · \(size)",
+      "同帧 \(statSameFrame)（显示 \(statSameFrameShown)）· 跳过 \(statDuplicateSkip) · 图层 \(displayLayer.superlayer === hostView.layer ? "host" : "other")",
+      "保活 \(statTimerTicks)/\(statStallRecover)（显示 \(statStallShown)/未显示 \(statStallIdle)）· 空转 \(statRenderNil) · \(size)",
     ]
   }
 
@@ -1329,11 +1378,19 @@ public class PictureInPicture: NSObject {
       "startCalls": statStartCalls,
       "startFail": statStartFail,
       "sameFrame": statSameFrame,
+      "sameFrameShown": statSameFrameShown,
       "duplicateSkip": statDuplicateSkip,
+      "stallShown": statStallShown,
+      "stallIdle": statStallIdle,
+      "flushShown": statFlushShown,
       "stallNudge": statStallNudge,
       "controllerRebuild": statControllerRebuild,
       "layerDetached": layer.superlayer != nil
         && layer.superlayer !== hostView.layer,
+      // 画面图层此刻归谁：`host` = 还在我们自己的宿主视图里（系统没接管），
+      // `system` = 已被系统收进小窗窗口，`none` = 不在任何层级里。
+      "layerOwner": layer.superlayer == nil
+        ? "none" : (layer.superlayer === hostView.layer ? "host" : "system"),
       "bgSeconds": segment.seconds,
       "bgEnqueuedDelta": segment.enqueued,
       "bgSameFrameDelta": segment.sameFrame,
@@ -1343,6 +1400,7 @@ public class PictureInPicture: NSObject {
       "sinceShow": showingSince > 0 ? CACurrentMediaTime() - showingSince : -1,
       "startTries": startTries,
       "hostSide": Double(hostSide),
+      "hostAlpha": Double(hostView.alpha),
       // 画面源是否真的挂进了窗口（false = 被移除或窗口还没就绪）。
       "hostAttached": hostView.window != nil,
       "hostOrigin": hostOrigin,
@@ -1474,11 +1532,20 @@ public class PictureInPicture: NSObject {
         return
       }
       self.statTimerTicks += 1
-      // 图层已经超过 0.2 秒没拿到新样本：这次必须强制补（绕开「图层不就绪」的丢弃）。
-      // 阈值不能放大：0.5 秒的停顿在小窗里肉眼就是「卡住了」。
-      let stalled = gap > 0.2
+      // 图层已经超过阈值没拿到新样本：这次必须强制补（绕开「图层不就绪」的丢弃）。
+      //
+      // build 38：小窗显示中把阈值从 0.2 秒放宽到 0.5 秒。渲染回调正常时每帧都会
+      // 刷新 `lastLayerEnqueueAt`，这条通道根本轮不到；它一旦频繁触发，说明补帧
+      // 正在以 30fps 反复重推画面 —— 那本身就是小窗闪光的来源。
+      let threshold: CFTimeInterval = self.isShowing ? 0.5 : 0.2
+      let stalled = gap > threshold
       if stalled {
         self.statStallRecover += 1
+        if self.isShowing {
+          self.statStallShown += 1
+        } else {
+          self.statStallIdle += 1
+        }
       }
       self.onNeedFrame?(stalled)
     }
@@ -1549,6 +1616,7 @@ public class PictureInPicture: NSObject {
     let resumeRate: Double = mpvFlag("pause") ? 0 : 1
     let layer = displayLayer
     let timebase = controlTimebase
+    noteLayerFlush()
     layerQueue.async {
       layer.flush()
       if #available(iOS 15.0, *), let timebase = timebase {
@@ -1600,6 +1668,18 @@ public class PictureInPicture: NSObject {
   private func stopKeepAlive() {
     keepAliveSource?.cancel()
     keepAliveSource = nil
+  }
+
+  /// 记录一次「图层被清空」。
+  ///
+  /// 两件事都靠它：一是「刚清过就必须重推一帧」的判定（见 [enqueue]），二是
+  /// 「小窗显示中被清屏」的计数 —— 每清一次小窗就黑一下再出新帧，长播放里累积
+  /// 起来正是肉眼看到的频闪。可能在 `layerQueue` 上调用，只做两个赋值。
+  private func noteLayerFlush() {
+    lastLayerFlushAt = CACurrentMediaTime()
+    if isShowing {
+      statFlushShown += 1
+    }
   }
 
   /// 记录一次「渲染回调在跑，但取不到像素缓冲」（由 `VideoOutput` 在补帧时调用）。
@@ -1879,6 +1959,7 @@ extension PictureInPicture: AVPictureInPictureControllerDelegate {
       || displayLayer.requiresFlushToResumeDecoding
       || !displayLayer.isReadyForMoreMediaData
     {
+      noteLayerFlush()
       displayLayer.flush()
     }
     lastPosition = -1
