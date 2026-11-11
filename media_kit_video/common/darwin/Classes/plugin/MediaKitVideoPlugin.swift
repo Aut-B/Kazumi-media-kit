@@ -61,6 +61,8 @@ public class MediaKitVideoPlugin: NSObject, FlutterPlugin {
       handleSetPictureInPictureMethodCall(call.arguments, result)
     case "VideoOutput.SetAutoEnterPictureInPicture":
       handleSetAutoEnterPictureInPictureMethodCall(call.arguments, result)
+    case "VideoOutput.SetPictureInPictureQaMode":
+      handleSetPictureInPictureQaModeMethodCall(call.arguments, result)
     case "VideoOutput.IsPictureInPicturePossible":
       handleIsPictureInPicturePossibleMethodCall(call.arguments, result)
     case "VideoOutput.PictureInPictureDiagnostics":
@@ -341,6 +343,35 @@ public class MediaKitVideoPlugin: NSObject, FlutterPlugin {
     videoOutputManager.setAutoEnterPictureInPicture(
       handle: handle,
       value: value
+    )
+    result(nil)
+  }
+
+  /// 选择真机 QA 使用的画中画路径。
+  private func handleSetPictureInPictureQaModeMethodCall(
+    _ arguments: Any?,
+    _ result: FlutterResult
+  ) {
+    let args = arguments as? [String: Any]
+    guard let handleStr = args?["handle"] as? String,
+      let handle = Int64(handleStr)
+    else {
+      result(
+        FlutterError(
+          code: "invalid_args",
+          message: "handle must be an Int64",
+          details: nil
+        )
+      )
+      return
+    }
+
+    let value = (args?["value"] as? String) ?? "legacy"
+    let runId = (args?["runId"] as? String) ?? ""
+    videoOutputManager.setPictureInPictureQaMode(
+      handle: handle,
+      value: value,
+      runId: runId
     )
     result(nil)
   }

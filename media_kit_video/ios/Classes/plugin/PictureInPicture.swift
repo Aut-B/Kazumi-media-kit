@@ -1,6 +1,7 @@
 import AVFoundation
 import AVKit
 import CoreMedia
+import Foundation
 import UIKit
 
 /// 系统级画中画（Picture-in-Picture）。
@@ -53,6 +54,7 @@ public class PictureInPicture: NSObject {
     view.isUserInteractionEnabled = false
     view.backgroundColor = .clear
     view.alpha = PictureInPicture.hostIdleAlpha
+    view.layer.name = "media_kit.pip.host"
     return view
   }()
 
@@ -76,6 +78,182 @@ public class PictureInPicture: NSObject {
 
   /// 画面内诊断叠加层：把读数绘进帧副本，使「小窗是否收到了画面」可直接用肉眼判断。
   private let debugOverlay = PictureInPictureDebugOverlay()
+
+  /// QA 模式与运行编号。默认 `legacy`，保证 B 站等旧路径行为不变。
+  private let qaLock = NSLock()
+  private var _qaMode = "legacy"
+  private var _qaRunId = ""
+  private var _manualStartInFlight = false
+  private var _lastQaHeartbeatAt: CFTimeInterval = 0
+  private var _qaHostAttached = false
+  private var _qaHostAlpha = Double(PictureInPicture.hostIdleAlpha)
+  private var _qaHostSide = 2.0
+  private var _qaWindowBounds = "nil"
+  private var _qaLayerOwner = "none"
+  private var _qaLayerStatus = "unknown"
+  private var _qaTimebaseRate = 1.0
+  private let qaDiagQueue = DispatchQueue(
+    label: "media_kit.pip.qa.diag",
+    qos: .utility
+  )
+
+  private var qaMode: String {
+    get {
+      qaLock.lock()
+      defer { qaLock.unlock() }
+      return _qaMode
+    }
+    set {
+      qaLock.lock()
+      _qaMode = newValue
+      qaLock.unlock()
+    }
+  }
+
+  private var qaRunId: String {
+    get {
+      qaLock.lock()
+      defer { qaLock.unlock() }
+      return _qaRunId
+    }
+    set {
+      qaLock.lock()
+      _qaRunId = newValue
+      qaLock.unlock()
+    }
+  }
+
+  private var manualStartInFlight: Bool {
+    get {
+      qaLock.lock()
+      defer { qaLock.unlock() }
+      return _manualStartInFlight
+    }
+    set {
+      qaLock.lock()
+      _manualStartInFlight = newValue
+      qaLock.unlock()
+    }
+  }
+
+  private var isConservativeQaMode: Bool { qaMode == "system" }
+  private var isManualQaMode: Bool { qaMode == "manual" }
+  private var allowsForcedFrames: Bool {
+    !isConservativeQaMode || manualStartInFlight
+  }
+
+  public var allowsForcedFrame: Bool { allowsForcedFrames }
+
+  /// 选择 PiP 路径。`legacy` 是 B 站播放器的默认稳定路径；`system` 仅用于
+  /// 自动 QA 对照，`manual` 只允许手动按钮进入。
+  public func setQaMode(_ value: String, runId: String) {
+    let normalized =
+      value == "system" || value == "manual" ? value : "legacy"
+    qaMode = normalized
+    qaRunId = runId
+    manualStartInFlight = false
+    if normalized == "system" {
+      debugOverlay.enabled = false
+      hostSide = lastGoodHostSide
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self else { return }
+        self.hostView.alpha = PictureInPicture.hostIdleAlpha
+        self.stopKeepAlive()
+      }
+    }
+    appendQaDiag(event: "mode")
+  }
+
+  private func appendQaDiagIfNeeded() {
+    let now = CACurrentMediaTime()
+    qaLock.lock()
+    if now - _lastQaHeartbeatAt < 2.0 {
+      qaLock.unlock()
+      return
+    }
+    _lastQaHeartbeatAt = now
+    qaLock.unlock()
+    appendQaDiag(event: "heartbeat")
+  }
+
+  /// 轻量诊断落盘。只读线程安全的标量，不调用 `diagnostics()`：后者需要
+  /// AVKit / UIKit 主线程状态，不能从后台队列或渲染线程调用。
+  private func appendQaDiag(event: String) {
+    let snapshot = qaDiagSnapshot(event: event)
+    qaDiagQueue.async {
+      guard
+        let document = FileManager.default.urls(
+          for: .documentDirectory,
+          in: .userDomainMask
+        ).first,
+        let data = try? JSONSerialization.data(
+          withJSONObject: snapshot,
+          options: [.sortedKeys]
+        ),
+        let line = String(data: data, encoding: .utf8)
+      else {
+        return
+      }
+      let path = document.appendingPathComponent("pip_diag.jsonl")
+      let latest = document.appendingPathComponent("pip_diag_latest.txt")
+      let lineData = Data((line + "\n").utf8)
+      if !FileManager.default.fileExists(atPath: path.path) {
+        try? lineData.write(to: path, options: .atomic)
+      } else if let handle = try? FileHandle(forWritingTo: path) {
+        try? handle.seekToEnd()
+        try? handle.write(contentsOf: lineData)
+        try? handle.close()
+      }
+      try? data.write(to: latest, options: .atomic)
+    }
+  }
+
+  private func qaDiagSnapshot(event: String) -> [String: Any] {
+    qaLock.lock()
+    let hostAttached = _qaHostAttached
+    let hostAlpha = _qaHostAlpha
+    let hostSideValue = _qaHostSide
+    let windowBounds = _qaWindowBounds
+    let layerOwner = _qaLayerOwner
+    let layerStatus = _qaLayerStatus
+    let timebaseRate = _qaTimebaseRate
+    qaLock.unlock()
+    let effectiveRate = timebaseRate >= 0
+      ? timebaseRate
+      : (mpvFlag("pause") ? 0 : 1)
+    return [
+      "ts": Date().timeIntervalSince1970,
+      "runId": qaRunId,
+      "mode": qaMode,
+      "event": event,
+      "appState": appIsBackground ? "background" : "active",
+      "showing": isShowing,
+      "armed": isArmed,
+      "possible": possibleCache,
+      "didStart": statDidStart,
+      "didStop": statDidStop,
+      "startCalls": statStartCalls,
+      "bgEnqueued": statBgEnqueued,
+      "fgEnqueued": statFgEnqueued,
+      "sameFrame": statSameFrame,
+      "duplicateSkip": statDuplicateSkip,
+      "stallShown": statStallShown,
+      "flushShown": statFlushShown,
+      "frameSig": String(lastFrameSignature),
+      "progress": mpvPosition(),
+      "timebaseRate": effectiveRate,
+      "layerOwner": layerOwner,
+      "layerStatus": layerStatus,
+      "hostAttached": hostAttached,
+      "hostAlpha": hostAlpha,
+      "hostSide": hostSideValue,
+      "windowBounds": windowBounds,
+      "audioActive": audioSessionActive,
+      "paused": mpvFlag("pause"),
+      "keepAliveTicks": statTimerTicks,
+      "manualStartInFlight": manualStartInFlight,
+    ]
+  }
 
   /// 是否处于「已武装」状态：为 true 时向 [displayLayer] 提供画面帧。
   ///
@@ -375,6 +553,7 @@ public class PictureInPicture: NSObject {
   @objc private func handleDidEnterBackground() {
     appIsBackground = true
     beginBackgroundSegment()
+    appendQaDiag(event: "background")
     // 新的一段后台窗口期：看门狗与「重建等待」都从零开始。
     stallWatchPosition = -1
     stallWatchAt = 0
@@ -389,57 +568,53 @@ public class PictureInPicture: NSObject {
       retryAudioSession([0.5, 1.5, 3.0])
     }
     beginBackgroundTaskIfNeeded()
-    startKeepAlive()
-    // 小窗已经在显示时，系统会在切到后台的瞬间让图层暂停消化队列里的样本：队列
-    // 看起来还是满的、`isReadyForMoreMediaData` 也可能一直不恢复，小窗就定在最后
-    // 一帧。主动清一次队列并把时间轴拉回当前播放位置，让新帧从头开始进。
-    //
-    // 这里原先只认 `isShowing`。6S 上系统自动建窗时既不送 didStart、controller
-    // 也一直报 inactive，`isShowing` 恒为 false —— 于是这段恢复一次都没跑过，
-    // 图层从切后台那一刻起就卡住。已武装就一律恢复。
-    if isShowing || isArmed {
-      let layer = displayLayer
-      let timebase = controlTimebase
-      let resumeAt = mpvPosition()
-      let resumeRate: Double = mpvFlag("pause") ? 0 : 1
-      noteLayerFlush()
-      layerQueue.async {
-        layer.flush()
-        if #available(iOS 15.0, *), let timebase = timebase {
-          CMTimebaseSetTime(
-            timebase,
-            time: CMTime(seconds: resumeAt, preferredTimescale: 600)
-          )
-          if CMTimebaseGetRate(timebase) != resumeRate {
-            CMTimebaseSetRate(timebase, rate: resumeRate)
+    if !isConservativeQaMode {
+      startKeepAlive()
+      // 小窗已经在显示时，系统会在切到后台的瞬间让图层暂停消化队列里的样本：队列
+      // 看起来还是满的、`isReadyForMoreMediaData` 也可能一直不恢复，小窗就定在最后
+      // 一帧。主动清一次队列并把时间轴拉回当前播放位置，让新帧从头开始进。
+      if isShowing || isArmed {
+        let layer = displayLayer
+        let timebase = controlTimebase
+        let resumeAt = mpvPosition()
+        let resumeRate: Double = mpvFlag("pause") ? 0 : 1
+        noteLayerFlush()
+        layerQueue.async {
+          layer.flush()
+          if #available(iOS 15.0, *), let timebase = timebase {
+            CMTimebaseSetTime(
+              timebase,
+              time: CMTime(seconds: resumeAt, preferredTimescale: 600)
+            )
+            if CMTimebaseGetRate(timebase) != resumeRate {
+              CMTimebaseSetRate(timebase, rate: resumeRate)
+            }
           }
         }
       }
+      if #available(iOS 15.0, *), !isShowing {
+        _startImmediately()
+      }
+      onNeedFrame?(true)
+    } else {
+      stopKeepAlive()
     }
-    // `inactive` 只给了零点几秒，很多情况下那一刻 `isPictureInPicturePossible`
-    // 还是 false，前台那次启动就这么废了。真正进到后台时再补一次：此时后台续命
-    // 任务已经拿到，阶梯可以完整跑完 —— 这是 6S 上最后缺的那一环。
-    if #available(iOS 15.0, *), !isShowing {
-      // 同一轮 runloop 内直接启动。这里原来是 `DispatchQueue.main.async`，而 6S
-      // 上主队列在 `didEnterBackground` 之后就不再被调度 —— 那个 block 一次都
-      // 没跑过（build 34 / 35 读数：`后台启动调用 0`、`校正尝试 0`）。
-      _startImmediately()
-    }
-    // 立刻补一帧：后台切换的瞬间系统最容易把渲染回调掐掉。
-    onNeedFrame?(true)
   }
 
   @objc private func handleWillEnterForeground() {
     appIsBackground = false
     endBackgroundSegment()
+    appendQaDiag(event: "foreground")
     endBackgroundTaskIfNeeded()
+    manualStartInFlight = false
+    startDeadline = 0
     stallWatchPosition = -1
     stallWatchAt = 0
     lastStallNudge = 0
     rebuildWaitSince = 0
     // 从小窗 / 后台回来时，图层可能停在「等 PTS」或「解码待刷新」的状态，App 里
     // 那块画面就定格在最后一帧。清一次队列并立刻补一帧。
-    if !isShowing {
+    if !isShowing && !isConservativeQaMode {
       let layer = displayLayer
       // 图层仍在正常渲染时不要清屏：每清一次画面都会黑一下再出新帧，回前台
       // 那一下就会变成一次可见的闪。
@@ -529,6 +704,7 @@ public class PictureInPicture: NSObject {
       return
     }
 
+    manualStartInFlight = true
     isArmed = true
     resetDiagnostics()
     resetCumulative()
@@ -551,6 +727,7 @@ public class PictureInPicture: NSObject {
     onNeedFrame?(true)
     startKeepAlive()
     _startImmediately()
+    appendQaDiag(event: "manual_start")
   }
 
   /// 立刻启动画中画：不做 `isPictureInPicturePossible` 预判。
@@ -584,8 +761,14 @@ public class PictureInPicture: NSObject {
   /// 后台那一下根本无窗可开。这里按 24 → 64 点逐档放大（不透明度仍是最低的
   /// 0.02，屏幕上几乎看不出来），直到系统点头为止。
   private func prewarmPossible() {
+    guard !isConservativeQaMode || manualStartInFlight else { return }
     DispatchQueue.main.async { [weak self] in
-      guard let self = self, self.isArmed, !self.isShowing else { return }
+      guard
+        let self = self,
+        self.isArmed,
+        !self.isShowing,
+        !self.isConservativeQaMode || self.manualStartInFlight
+      else { return }
       guard let controller = self.pipController else { return }
       self.statPrewarm += 1
       let possible = controller.isPictureInPicturePossible
@@ -660,20 +843,9 @@ public class PictureInPicture: NSObject {
 
     // 宿主视图平时只有 2 点见方；个别系统版本对画面源的尺寸判定更严，迟迟不就绪
     // 时放大一档（对已经就绪的设备没有任何影响）。
-    if startTries >= 2, hostSide < 64 {
+    if startTries >= 2, hostSide < 64, allowsForcedFrames {
       hostSide = hostSide < 24 ? 24 : 64
-      // 与放大同步把不透明度提回来：万一「近乎全透明」在个别机型上被判成
-      // 「画面源不可见」，这一步就是兜底。小窗弹出后 [didStart] 会立刻降回去。
-      hostView.alpha = 1
-      // build 38：这一档只是「兜底提亮」。启动最终没成功（`didStart` 不来）时，
-      // 这块 24/64 点的不透明方块会一直留在屏幕正中，看起来就是一块亮斑 / 红光。
-      // 2 秒后无条件降回常态透明度。
-      DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-        guard let self = self else { return }
-        if !self.isShowing {
-          self.hostView.alpha = PictureInPicture.hostIdleAlpha
-        }
-      }
+      hostView.alpha = PictureInPicture.hostIdleAlpha
       attachDisplayLayer()
     }
 
@@ -681,6 +853,7 @@ public class PictureInPicture: NSObject {
       scheduleStartRetry()
       return
     }
+    manualStartInFlight = false
 
     // 阶梯走到尽头：把判断依据一并报出来，免得又只能靠猜。
     emitError(
@@ -707,6 +880,7 @@ public class PictureInPicture: NSObject {
     guard AVPictureInPictureController.isPictureInPictureSupported() else {
       return
     }
+    manualStartInFlight = false
     isArmed = true
     resetCumulative()
     hostSide = lastGoodHostSide
@@ -715,16 +889,22 @@ public class PictureInPicture: NSObject {
       guard let controller = self._ensureController() else {
         return
       }
-      controller.canStartPictureInPictureAutomaticallyFromInline = autoEnter
+      controller.canStartPictureInPictureAutomaticallyFromInline =
+        autoEnter && !self.isManualQaMode
       // 自动进入（划回主屏幕）走的是系统的判定，同样要求图层里「有内容」；
       // 这里先补一帧，免得用户划出去时系统还在等第一帧。
-      self.onNeedFrame?(true)
+      if !self.isConservativeQaMode {
+        self.onNeedFrame?(true)
+      }
       // 补帧通道在「武装」阶段就架好：自动进入画中画时 `didStart` 可能要到 App
       // 已经退到后台才送达，那时再挂定时器就晚了。通道内部只在「小窗已显示」或
       // 「App 已在后台」时才真正补帧，前台正常播放时它一次都不会插手。
-      if autoEnter {
+      if autoEnter && !self.isConservativeQaMode {
         self.startKeepAlive()
+      } else {
+        self.stopKeepAlive()
       }
+      self.appendQaDiag(event: "arm")
     }
   }
 
@@ -739,6 +919,7 @@ public class PictureInPicture: NSObject {
     // 用户已经收起小窗，正在进行的启动重试必须一并作罢，否则它会随后把
     // 小窗重新弹出来。
     startDeadline = 0
+    manualStartInFlight = false
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
       // 取消可能半途而废的启动阶梯留下的「提亮」状态。
@@ -750,6 +931,7 @@ public class PictureInPicture: NSObject {
 
   /// 不再向系统提供画中画画面源。仅用于释放前的收尾。
   public func disarm() {
+    manualStartInFlight = false
     isArmed = false
     isShowing = false
     lastPosition = -1
@@ -771,6 +953,11 @@ public class PictureInPicture: NSObject {
   /// 正常、小窗一直黑」。这里清空图层与时间轴，并丢掉上一集的弹幕，
   /// 控制器本身保持不动，因此小窗会在下一帧到来后无缝接上新视频。
   public func prepareForNewMedia() {
+    guard !isConservativeQaMode else {
+      lastPosition = -1
+      lastIdleEnqueue = 0
+      return
+    }
     danmaku.clear()
     lastPosition = -1
     lastIdleEnqueue = 0
@@ -863,6 +1050,7 @@ public class PictureInPicture: NSObject {
       return
     }
     statAttempt += 1
+    appendQaDiagIfNeeded()
     if appIsBackground {
       statBgEnqueued += 1
     } else {
@@ -886,7 +1074,7 @@ public class PictureInPicture: NSObject {
         // 这里原来只认 isShowing。自动进小窗（划回主屏幕）时系统经常不送
         // didStart，isShowing 一直是 false，于是「图层不肯收样本」这件事
         // 一次都不会被恢复——小窗就永远停在那一帧。后台态同样算「小窗在用」。
-        if isShowing || appIsBackground {
+        if (isShowing || appIsBackground) && allowsForcedFrames {
           if notReadySince == 0 {
             notReadySince = now
           } else if now - notReadySince > 1.0, now - lastStuckFlush > 3.0 {
@@ -918,7 +1106,7 @@ public class PictureInPicture: NSObject {
     }
     notReadySince = 0
 
-    if !isShowing, !force, !appIsBackground {
+    if !isShowing, !force, !appIsBackground, allowsForcedFrames {
       // 小窗还没显示：仍要维持图层里有画面——系统正是据此判断「有内容可以画中画」，
       // 否则划回主屏幕时不会自动进入。但降到约 10 fps，避免长时间占住 Flutter
       // 那几个轮转使用的像素缓冲。
@@ -939,7 +1127,8 @@ public class PictureInPicture: NSObject {
     // 闪一下——长时间播放后「看多了就频闪 / 红屏」正是这么累积出来的。
     // 因此要求倒退超过 2 秒，且两次清屏至少间隔 2 秒。
     let positionNow = CACurrentMediaTime()
-    if lastPosition >= 0, position < lastPosition - 2,
+    if !isConservativeQaMode,
+      lastPosition >= 0, position < lastPosition - 2,
       positionNow - lastPositionFlush > 2.0
     {
       lastPositionFlush = positionNow
@@ -970,7 +1159,7 @@ public class PictureInPicture: NSObject {
     // 诊断叠加层：开机时把读数自身画进小窗。小窗里看得到这些字，就说明帧确实送到了
     // 图层，黑屏发生在「系统把图层内容接进小窗」那一环；一片纯黑连字也没有，则说明
     // 帧压根没送进去。这是零成本区分两类成因的办法（仅诊断时开启）。
-    if debugOverlay.enabled,
+    if debugOverlay.enabled && allowsForcedFrames,
       let composed = debugOverlay.composite(frame, lines: debugLines(frame))
     {
       frame = composed
@@ -1074,11 +1263,15 @@ public class PictureInPicture: NSObject {
       // 变成「频闪 / 红屏」。显示中把间隔放宽到 4 秒，未显示（预热、建窗
       // 窗口期）时 1.5 秒，仍然能保证图层不会因为拒收样本而永久黑屏。
       let flushGap: CFTimeInterval = self.isShowing ? 4.0 : 1.5
-      let resumeFlush =
-        layer.requiresFlushToResumeDecoding && now - self.lastResumeFlush > flushGap
-      if layer.status == .failed
-        || resumeFlush
-        || (force && !layer.isReadyForMoreMediaData)
+      let resumeFlush = !self.isConservativeQaMode
+        && layer.requiresFlushToResumeDecoding
+        && now - self.lastResumeFlush > flushGap
+      let forceFlush = force && allowsForcedFrames
+      let shouldFlush = !self.isConservativeQaMode
+        && (layer.status == .failed
+          || resumeFlush
+          || (forceFlush && !layer.isReadyForMoreMediaData))
+      if shouldFlush
       {
         if resumeFlush {
           self.statResumeFlush += 1
@@ -1102,7 +1295,7 @@ public class PictureInPicture: NSObject {
 
   /// 开启 / 关闭「画面内诊断叠加层」（排障用，读数会直接画进小窗）。
   public func setDebugOverlayEnabled(_ value: Bool) {
-    debugOverlay.enabled = value
+    debugOverlay.enabled = value && !qaRunId.isEmpty
   }
 
   /// 下发弹幕显示参数（字号缩放、透明度、滚动时长等），与 App 内的弹幕设置保持一致。
@@ -1338,7 +1531,7 @@ public class PictureInPicture: NSObject {
   public func diagnostics() -> [String: Any] {
     let layer = displayLayer
     possibleCache = pipController?.isPictureInPicturePossible ?? false
-    var rate: Double = -1
+    var rate: Double = mpvFlag("pause") ? 0 : 1
     if #available(iOS 15.0, *), let timebase = controlTimebase {
       rate = CMTimebaseGetRate(timebase)
     }
@@ -1467,6 +1660,10 @@ public class PictureInPicture: NSObject {
   /// 一次都没触发，小窗永远停在划走前的最后一帧。`DispatchSourceTimer` 跑在自己的
   /// 串行队列上，不受主 RunLoop 调度影响。
   private func startKeepAlive() {
+    guard !isConservativeQaMode || manualStartInFlight else {
+      stopKeepAlive()
+      return
+    }
     stopKeepAlive()
     let source = DispatchSource.makeTimerSource(queue: keepAliveQueue)
     source.schedule(
@@ -1687,6 +1884,27 @@ public class PictureInPicture: NSObject {
     statCopyNil += 1
   }
 
+  /// 记录宿主视图的状态快照，避免在渲染线程上读取 UIKit。
+  public func noteHostViewState(
+    attached: Bool,
+    alpha: Double,
+    side: Double,
+    windowBounds: String,
+    layerOwner: String? = nil,
+    layerStatus: String? = nil,
+    timebaseRate: Double? = nil
+  ) {
+    recordHostViewState(
+      attached: attached,
+      alpha: alpha,
+      side: side,
+      windowBounds: windowBounds,
+      layerOwner: layerOwner,
+      layerStatus: layerStatus,
+      timebaseRate: timebaseRate
+    )
+  }
+
   /// 建立画面图层的时间轴（只做一次）。
   @available(iOS 15.0, *)
   private func setupTimebase() {
@@ -1739,6 +1957,38 @@ public class PictureInPicture: NSObject {
     return value
   }
 
+  private func effectiveTimebaseRate() -> Double {
+    if #available(iOS 15.0, *), let timebase = controlTimebase {
+      return CMTimebaseGetRate(timebase)
+    }
+    return mpvFlag("pause") ? 0 : 1
+  }
+
+  /// 把 UIKit 侧的一次性状态写进 QA 快照；`layerOwner` 为 nil 时按当前图层归属判断。
+  private func recordHostViewState(
+    attached: Bool,
+    alpha: Double,
+    side: Double,
+    windowBounds: String,
+    layerOwner: String? = nil,
+    layerStatus: String? = nil,
+    timebaseRate: Double? = nil
+  ) {
+    let owner = layerOwner ?? (displayLayer.superlayer == nil
+      ? "none"
+      : (displayLayer.superlayer === hostView.layer ? "host" : "system"))
+    qaLock.lock()
+    _qaHostAttached = attached
+    _qaHostAlpha = alpha
+    _qaHostSide = side
+    _qaWindowBounds = windowBounds
+    _qaLayerOwner = owner
+    _qaLayerStatus = layerStatus ?? layerStatusText()
+    _qaTimebaseRate = timebaseRate ?? effectiveTimebaseRate()
+    qaLock.unlock()
+    appendQaDiag(event: "host_state")
+  }
+
   /// 把图层挂进视图层级：置于极小宿主视图内、叠在 Flutter 视图之上。
   ///
   /// 之所以不直接挂在 window 图层最底层：那样会被 Flutter 视图完全遮挡，部分系统
@@ -1756,6 +2006,17 @@ public class PictureInPicture: NSObject {
     if !force, let superlayer = displayLayer.superlayer,
       superlayer !== hostView.layer
     {
+      var bounds = "nil"
+      if let window = PictureInPicture.keyWindow {
+        bounds = "\(Int(window.bounds.width))x\(Int(window.bounds.height))"
+      }
+      recordHostViewState(
+        attached: hostView.window != nil,
+        alpha: Double(hostView.alpha),
+        side: Double(hostSide),
+        windowBounds: bounds,
+        layerOwner: "system"
+      )
       return
     }
     guard let window = PictureInPicture.keyWindow else {
@@ -1784,10 +2045,17 @@ public class PictureInPicture: NSObject {
     displayLayer.videoGravity = .resizeAspect
     displayLayer.backgroundColor = UIColor.clear.cgColor
     displayLayer.isHidden = false
+    hostView.layer.name = "media_kit.pip.host"
     if displayLayer.superlayer !== hostView.layer {
       displayLayer.removeFromSuperlayer()
       hostView.layer.addSublayer(displayLayer)
     }
+    noteHostViewState(
+      attached: hostView.window != nil,
+      alpha: Double(hostView.alpha),
+      side: Double(hostSide),
+      windowBounds: "\(Int(window.bounds.width))x\(Int(window.bounds.height))"
+    )
   }
 
   /// 把一帧复制到自有缓冲池。必须在 `renderSynchronized` 之后调用。
@@ -1941,6 +2209,7 @@ extension PictureInPicture: AVPictureInPictureControllerDelegate {
     // 小窗已经出现，说明系统认可这个画面源。此刻无论此前状态如何，都保证图层
     // 处于「提供画面」状态，否则小窗会定格在最后一帧、甚至全黑。
     statDidStart += 1
+    manualStartInFlight = false
     isArmed = true
     isShowing = true
     startDeadline = 0
@@ -1955,7 +2224,8 @@ extension PictureInPicture: AVPictureInPictureControllerDelegate {
     }
     // 启动阶段为了「让系统判定画面源可用」补过几帧，那批样本的时间戳与队列状态
     // 未必干净；小窗真正开始接管画面时清一次队列，让随后送进来的帧从头开始。
-    if displayLayer.status == .failed
+    if allowsForcedFrames,
+      displayLayer.status == .failed
       || displayLayer.requiresFlushToResumeDecoding
       || !displayLayer.isReadyForMoreMediaData
     {
@@ -1976,7 +2246,10 @@ extension PictureInPicture: AVPictureInPictureControllerDelegate {
     }
     startKeepAlive()
     // 立即补一帧，别等下一次渲染回调或保活定时器。
-    onNeedFrame?(true)
+    if allowsForcedFrames {
+      onNeedFrame?(true)
+    }
+    appendQaDiag(event: "did_start")
     eventCallback("VideoOutput.PictureInPictureStateChanged", ["active": true])
   }
 
@@ -1984,6 +2257,8 @@ extension PictureInPicture: AVPictureInPictureControllerDelegate {
     _ pictureInPictureController: AVPictureInPictureController
   ) {
     statDidStop += 1
+    manualStartInFlight = false
+    startDeadline = 0
     isShowing = false
     showingSince = 0
     lastReconcile = 0
@@ -1994,12 +2269,13 @@ extension PictureInPicture: AVPictureInPictureControllerDelegate {
     attachDisplayLayer()
     // 仍然武装着就继续跑保活：前台预热靠它把「可启动」状态一直养着，
     // 下一次切后台才不用等。它在正常播放时只做一秒一次的判定，几乎不耗电。
-    if isArmed {
+    if isArmed && !isConservativeQaMode {
       startKeepAlive()
     } else {
       stopKeepAlive()
     }
     endBackgroundTaskIfNeeded()
+    appendQaDiag(event: "did_stop")
     eventCallback("VideoOutput.PictureInPictureStateChanged", ["active": false])
   }
 

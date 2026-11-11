@@ -63,6 +63,17 @@ abstract class PlatformVideoController {
   /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台为空实现。
   Future<void> setAutoEnterPictureInPicture(bool value) => Future.value();
 
+  /// 选择真机 QA 使用的画中画路径。
+  ///
+  /// `legacy` 是 B 站播放器验证过的默认路径：系统自动进入，并保留预热、
+  /// 后台保活与卡死恢复；`system` 仅用于自动 QA 对照，`manual` 只允许手动按钮启动。
+  /// 其它平台为空实现。
+  Future<void> setPictureInPictureQaMode(
+    String mode, {
+    String runId = '',
+  }) =>
+      Future.value();
+
   /// 当前是否具备进入画中画的条件（图层已就绪、已渲染首帧等）。
   ///
   /// 目前仅 iOS（15+）在 [NativeVideoController] 中实现，其它平台恒为 `false`。

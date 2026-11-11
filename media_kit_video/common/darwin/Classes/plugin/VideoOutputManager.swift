@@ -45,6 +45,15 @@ public class VideoOutputManager: NSObject {
     self.videoOutputs[handle]?.setAutoEnterPictureInPicture(value)
   }
 
+  /// 选择真机 QA 使用的画中画路径。
+  public func setPictureInPictureQaMode(
+    handle: Int64,
+    value: String,
+    runId: String
+  ) {
+    self.videoOutputs[handle]?.setPictureInPictureQaMode(value, runId: runId)
+  }
+
   /// 当前是否具备进入画中画的条件。
   public func isPictureInPicturePossible(
     handle: Int64

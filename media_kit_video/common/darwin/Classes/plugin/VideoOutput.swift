@@ -57,6 +57,8 @@ public class VideoOutput: NSObject {
     private let feedLock = NSLock()
     private var feedPending = false
     private var feedForce = false
+    private var pendingQaMode = "legacy"
+    private var pendingQaRunId = ""
   #endif
 
   init(
@@ -131,6 +133,20 @@ public class VideoOutput: NSObject {
       worker.enqueue {
         let pip = self.ensurePictureInPicture()
         pip?.arm(autoEnter: value)
+      }
+    #endif
+  }
+
+  /// 选择真机 QA 使用的画中画路径。
+  public func setPictureInPictureQaMode(_ value: String, runId: String) {
+    #if os(iOS)
+      DispatchQueue.main.async {
+        self.pendingQaMode = value
+        self.pendingQaRunId = runId
+        self.ensurePictureInPicture()?.setQaMode(
+          value,
+          runId: runId
+        )
       }
     #endif
   }
@@ -224,6 +240,7 @@ public class VideoOutput: NSObject {
         handle: self.handle,
         eventCallback: self.pipEventCallback
       )
+      pip.setQaMode(self.pendingQaMode, runId: self.pendingQaRunId)
       // 启动阶段与小窗保活都会走这里：前者需要「强势补帧」（图层不就绪也要送进去），
       // 后者走温和路径即可。取像素缓冲必须走渲染线程，因此这里只回投一个任务；
       // 任务同刻最多只排一个（见 [feedPending]），避免队列被高频补帧撑开。

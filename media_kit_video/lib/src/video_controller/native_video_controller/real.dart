@@ -194,6 +194,28 @@ class NativeVideoController extends PlatformVideoController {
     }
   }
 
+  /// 选择真机 QA 使用的画中画路径（仅 iOS）。
+  @override
+  Future<void> setPictureInPictureQaMode(
+    String mode, {
+    String runId = '',
+  }) async {
+    if (!Platform.isIOS) {
+      return;
+    }
+    try {
+      await _channel.invokeMethod('VideoOutput.SetPictureInPictureQaMode', {
+        'handle': player.handle.toString(),
+        'value': mode,
+        'runId': runId,
+      });
+    } catch (exception) {
+      debugPrint(
+        'NativeVideoController: setPictureInPictureQaMode: $exception',
+      );
+    }
+  }
+
   /// 当前是否具备进入画中画的条件（仅 iOS）。
   @override
   Future<bool> isPictureInPicturePossible() async {
