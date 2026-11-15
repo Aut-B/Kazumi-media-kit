@@ -144,11 +144,12 @@ public class PictureInPicture: NSObject {
 
   public var allowsForcedFrame: Bool { allowsForcedFrames }
 
-  /// 选择 PiP 路径。`legacy` 是 B 站播放器的默认稳定路径；`system` 仅用于
-  /// 自动 QA 对照，`manual` 只允许手动按钮进入。
+  /// 选择 PiP 路径。`legacy` 是 B 站播放器的默认稳定路径；短视频默认使用
+  /// `system` 让系统接管图层，不启用 30fps 保活与反复补帧。`manual` 只允许
+  /// 手动按钮进入；`bili` 是短视频侧的前台启动对照模式。
   public func setQaMode(_ value: String, runId: String) {
-    let normalized =
-      value == "system" || value == "manual" ? value : "legacy"
+    let allowed = ["legacy", "system", "manual", "bili"]
+    let normalized = allowed.contains(value) ? value : "legacy"
     qaMode = normalized
     qaRunId = runId
     manualStartInFlight = false
@@ -159,6 +160,14 @@ public class PictureInPicture: NSObject {
         guard let self = self else { return }
         self.hostView.alpha = PictureInPicture.hostIdleAlpha
         self.stopKeepAlive()
+        self.recordHostViewState(
+          attached: self.hostView.window != nil,
+          alpha: Double(self.hostView.alpha),
+          side: Double(self.hostSide),
+          windowBounds: PictureInPicture.keyWindow.map {
+            "\(Int($0.bounds.width))x\(Int($0.bounds.height))"
+          } ?? "nil"
+        )
       }
     }
     appendQaDiag(event: "mode")
@@ -243,6 +252,7 @@ public class PictureInPicture: NSObject {
       "progress": mpvPosition(),
       "timebaseRate": effectiveRate,
       "layerOwner": layerOwner,
+      "layerDetached": layerOwner == "system",
       "layerStatus": layerStatus,
       "hostAttached": hostAttached,
       "hostAlpha": hostAlpha,
@@ -598,6 +608,21 @@ public class PictureInPicture: NSObject {
       onNeedFrame?(true)
     } else {
       stopKeepAlive()
+      if isConservativeQaMode {
+        DispatchQueue.main.async { [weak self] in
+          guard let self = self else { return }
+          let bounds = PictureInPicture.keyWindow.map {
+            "\(Int($0.bounds.width))x\(Int($0.bounds.height))"
+          } ?? "nil"
+          self.recordHostViewState(
+            attached: self.hostView.window != nil,
+            alpha: Double(self.hostView.alpha),
+            side: Double(self.hostSide),
+            windowBounds: bounds
+          )
+          self.appendQaDiag(event: "background_system")
+        }
+      }
     }
   }
 
@@ -891,11 +916,9 @@ public class PictureInPicture: NSObject {
       }
       controller.canStartPictureInPictureAutomaticallyFromInline =
         autoEnter && !self.isManualQaMode
-      // 自动进入（划回主屏幕）走的是系统的判定，同样要求图层里「有内容」；
-      // 这里先补一帧，免得用户划出去时系统还在等第一帧。
-      if !self.isConservativeQaMode {
-        self.onNeedFrame?(true)
-      }
+      // 自动进入（划回主屏幕）走系统的判定，要求图层里「有内容」。无论哪条
+      // 路径都只补一次干净首帧；system 不启动持续保活，也不反复 flush。
+      self.onNeedFrame?(true)
       // 补帧通道在「武装」阶段就架好：自动进入画中画时 `didStart` 可能要到 App
       // 已经退到后台才送达，那时再挂定时器就晚了。通道内部只在「小窗已显示」或
       // 「App 已在后台」时才真正补帧，前台正常播放时它一次都不会插手。
@@ -2244,10 +2267,26 @@ extension PictureInPicture: AVPictureInPictureControllerDelegate {
     if !audioSessionActive {
       retryAudioSession([0.5, 1.5, 3.0])
     }
-    startKeepAlive()
+    if isConservativeQaMode {
+      stopKeepAlive()
+    } else {
+      startKeepAlive()
+    }
     // 立即补一帧，别等下一次渲染回调或保活定时器。
     if allowsForcedFrames {
       onNeedFrame?(true)
+    }
+    if isConservativeQaMode {
+      stopKeepAlive()
+      let bounds = PictureInPicture.keyWindow.map {
+        "\(Int($0.bounds.width))x\(Int($0.bounds.height))"
+      } ?? "nil"
+      recordHostViewState(
+        attached: hostView.window != nil,
+        alpha: Double(hostView.alpha),
+        side: Double(hostSide),
+        windowBounds: bounds
+      )
     }
     appendQaDiag(event: "did_start")
     eventCallback("VideoOutput.PictureInPictureStateChanged", ["active": true])

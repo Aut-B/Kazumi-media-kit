@@ -140,7 +140,7 @@ public class VideoOutput: NSObject {
   /// 选择真机 QA 使用的画中画路径。
   public func setPictureInPictureQaMode(_ value: String, runId: String) {
     #if os(iOS)
-      DispatchQueue.main.async {
+      worker.enqueue {
         self.pendingQaMode = value
         self.pendingQaRunId = runId
         self.ensurePictureInPicture()?.setQaMode(
