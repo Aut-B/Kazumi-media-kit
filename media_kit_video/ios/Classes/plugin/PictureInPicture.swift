@@ -214,6 +214,29 @@ public class PictureInPicture: NSObject {
         try? handle.close()
       }
       try? data.write(to: latest, options: .atomic)
+      // TrollStore 包取不回 Documents（house_arrest 需要 installd 记录），
+      // 所以同一份诊断必须往 AFC 能拉的 Media 目录再写一份，否则真机跑完
+      // 一轮仍然只有「黑盒」。
+      let mediaDir = "/private/var/mobile/Media/piliplus_qa"
+      try? FileManager.default.createDirectory(
+        atPath: mediaDir,
+        withIntermediateDirectories: true
+      )
+      let mediaPath = (mediaDir as NSString).appendingPathComponent(
+        "pip_diag.jsonl"
+      )
+      if !FileManager.default.fileExists(atPath: mediaPath) {
+        try? lineData.write(toFile: mediaPath, atomically: true)
+      } else if let handle = FileHandle(forWritingAtPath: mediaPath) {
+        handle.seekToEndOfFile()
+        handle.write(lineData)
+        handle.closeFile()
+      }
+      try? data.write(
+        to: URL(fileURLWithPath: mediaDir)
+          .appendingPathComponent("pip_diag_latest.json"),
+        options: .atomic
+      )
     }
   }
 
