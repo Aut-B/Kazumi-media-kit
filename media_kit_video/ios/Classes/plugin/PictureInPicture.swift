@@ -225,9 +225,12 @@ public class PictureInPicture: NSObject {
       let mediaPath = (mediaDir as NSString).appendingPathComponent(
         "pip_diag.jsonl"
       )
-      if !FileManager.default.fileExists(atPath: mediaPath) {
-        try? lineData.write(toFile: mediaPath, atomically: true)
-      } else if let handle = FileHandle(forWritingAtPath: mediaPath) {
+        if !FileManager.default.fileExists(atPath: mediaPath) {
+          try? lineData.write(
+            to: URL(fileURLWithPath: mediaPath),
+            options: .atomic
+          )
+        } else if let handle = FileHandle(forWritingAtPath: mediaPath) {
         handle.seekToEndOfFile()
         handle.write(lineData)
         handle.closeFile()
