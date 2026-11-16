@@ -79,6 +79,9 @@ public class PictureInPicture: NSObject {
   /// 画面内诊断叠加层：把读数绘进帧副本，使「小窗是否收到了画面」可直接用肉眼判断。
   private let debugOverlay = PictureInPictureDebugOverlay()
 
+  /// 6s 上的红色泛屏是诊断叠加层写进帧缓冲的；正式包彻底不编译这条路径。
+  private let debugOverlayDisabled = true
+
   /// QA 模式与运行编号。默认 `legacy`，保证 B 站等旧路径行为不变。
   private let qaLock = NSLock()
   private var _qaMode = "legacy"
@@ -1208,7 +1211,8 @@ public class PictureInPicture: NSObject {
     // 诊断叠加层：开机时把读数自身画进小窗。小窗里看得到这些字，就说明帧确实送到了
     // 图层，黑屏发生在「系统把图层内容接进小窗」那一环；一片纯黑连字也没有，则说明
     // 帧压根没送进去。这是零成本区分两类成因的办法（仅诊断时开启）。
-    if debugOverlay.enabled && allowsForcedFrames,
+    if !debugOverlayDisabled,
+      debugOverlay.enabled && allowsForcedFrames,
       let composed = debugOverlay.composite(frame, lines: debugLines(frame))
     {
       frame = composed
@@ -1344,7 +1348,7 @@ public class PictureInPicture: NSObject {
 
   /// 开启 / 关闭「画面内诊断叠加层」（排障用，读数会直接画进小窗）。
   public func setDebugOverlayEnabled(_ value: Bool) {
-    debugOverlay.enabled = value && !qaRunId.isEmpty
+    debugOverlay.enabled = false
   }
 
   /// 下发弹幕显示参数（字号缩放、透明度、滚动时长等），与 App 内的弹幕设置保持一致。
