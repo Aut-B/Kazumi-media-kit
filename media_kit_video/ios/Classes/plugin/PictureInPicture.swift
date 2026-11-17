@@ -304,6 +304,12 @@ public class PictureInPicture: NSObject {
 
   /// 上一帧对应的播放位置（秒），用于识别「换了视频源导致时间轴倒退」。
   private var lastPosition: Double = -1
+  /// 上一帧送进图层用的显示时间戳。
+  ///
+  /// `AVSampleBufferDisplayLayer` 收到时间戳不递增的样本时会直接不显示，后台若出现
+  /// 「帧在推、mpv 的 position 却不更新」，小窗就会定格在同一帧。这里保证时间戳
+  /// 严格单调，最多退化成每帧 +1ms。
+  private var lastPresentationStamp: Double = 0
 
   /// 上一次在「小窗未显示」状态下喂帧的时间，用于降频。
   private var lastIdleEnqueue: CFTimeInterval = 0
@@ -1238,11 +1244,12 @@ public class PictureInPicture: NSObject {
     var timing = CMSampleTimingInfo(
       duration: .invalid,
       presentationTimeStamp: CMTime(
-        seconds: position,
+        seconds: max(position, lastPresentationStamp + 0.001),
         preferredTimescale: 600
       ),
       decodeTimeStamp: .invalid
     )
+    lastPresentationStamp = max(position, lastPresentationStamp + 0.001)
 
     var sampleBuffer: CMSampleBuffer?
     let sampleStatus = CMSampleBufferCreateForImageBuffer(
@@ -1593,6 +1600,7 @@ public class PictureInPicture: NSObject {
     hasFrameSignature = false
     lastFrameSignature = 0
     lastFrameSignatureChangeAt = CACurrentMediaTime()
+    lastPresentationStamp = 0
     // 后台窗口期内（自动进小窗时 `didStart` 会调到这里）清零单次计数，
     // 基线要跟着挪，否则「后台入队」会算成负数。
     if bgSegmentStart > 0 {
