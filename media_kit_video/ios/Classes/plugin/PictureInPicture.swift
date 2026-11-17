@@ -519,6 +519,9 @@ public class PictureInPicture: NSObject {
   private var statSameFrame = 0
   private var lastFrameSignature: UInt64 = 0
   private var hasFrameSignature = false
+  /// 上一次内容真正变化（签名变了）的时刻：用来给「同帧跳过」加时间兜底，
+  /// 免得真实静止画面把小窗图层饿死。
+  private var lastFrameSignatureChangeAt = CACurrentMediaTime()
 
   /// 因为「内容和上一帧完全一样」而主动跳过入队的次数。
   ///
@@ -1289,10 +1292,19 @@ public class PictureInPicture: NSObject {
           // 一次可见的闪（15pm 上的红光 / 频闪）。build 38 起强制补帧也一并跳过，
           // 唯一例外是「刚刚清空过图层」—— 那时必须重推一帧，否则小窗会空着。
           // 这一条把补帧通道 30fps 的重推彻底掐掉。
-          if !force || CACurrentMediaTime() - lastLayerFlushAt > 0.5 {
+          //
+          // 再加一条时间兜底：真实静止画面（固定机位、封面帧）会让跳过一次都不放行，
+          // 图层长时间不收到样本就会被系统判成停摆，小窗看起来就是「卡死不动」。
+          // 所以无论内容变没变，超过 1 秒就强制放行一帧，保证图层持续活着。
+          let idleFor = CACurrentMediaTime() - lastFrameSignatureChangeAt
+          let mustRefresh = idleFor > 1.0
+          if !mustRefresh,
+             !force || CACurrentMediaTime() - lastLayerFlushAt > 0.5 {
             statDuplicateSkip += 1
             return
           }
+        } else {
+          lastFrameSignatureChangeAt = CACurrentMediaTime()
         }
         lastFrameSignature = signature
         hasFrameSignature = true
@@ -1474,40 +1486,87 @@ public class PictureInPicture: NSObject {
   }
 
   /// 计算一帧内容的粗签名：只采样四行各 64 字节，成本可忽略。
+  /// 帧内容签名：用来识别「这一帧和上一帧是不是同一个画面」。
+  ///
+  /// 两个曾经的致命问题，都会直接把 6S 的小窗定住：
+  ///
+  /// 1. 旧实现开头 `guard CVPixelBufferGetPlaneCount(buffer) == 0`，平面数不为 0
+  ///    就返回 0。可 mpv 解出来的 NV12 是**两平面**，只有 BGRA 才是单平面 ——
+  ///    也就是说 6S 上签名恒为 0，同帧检测从来没生效过。
+  /// 2. 旧实现只取画面中间 4 行、每行 64 字节。那块区域要是恰好静止（大片纯色
+  ///    背景、暗场），就判成「同帧」→ 整帧被丢 → 小窗画面定死不动，音频还在走。
+  ///    表现就是用户说的「卡帧 / 循环同一帧」。
+  ///
+  /// 现在对单平面和多平面都能算，采样点铺开成 8×8 网格覆盖整幅画面，
+  /// 任何一个区域在动都会让签名变化，不会再误判成同帧。
   private func frameSignature(_ buffer: CVPixelBuffer) -> UInt64 {
-    guard CVPixelBufferGetPlaneCount(buffer) == 0 else {
-      return 0
+    var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+    var sampled = false
+    let planeCount = CVPixelBufferGetPlaneCount(buffer)
+    if planeCount == 0 {
+      sampled = samplePlane(buffer, plane: nil, hash: &hash)
+    } else {
+      // 多平面：亮度平面已经能反映画面变化，取第 0 个就够，
+      // 顺带再采色度平面，避免「亮度一样、颜色在变」的罕见误判。
+      for plane in 0..<Swift.min(planeCount, 2) {
+        if samplePlane(buffer, plane: plane, hash: &hash) {
+          sampled = true
+        }
+      }
     }
-    guard CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess else {
-      return 0
+    return sampled ? hash : 0
+  }
+
+  /// 在指定平面（nil 表示单平面）上铺 8×8 网格采样，累加进 hash。
+  /// 返回 false 表示这个平面完全读不出来，调用方应当视为「无法判定」。
+  private func samplePlane(
+    _ buffer: CVPixelBuffer,
+    plane: Int?,
+    hash: inout UInt64
+  ) -> Bool {
+    let lockFlags: CVPixelBufferLockFlags = .readOnly
+    guard CVPixelBufferLockBaseAddress(buffer, lockFlags) == kCVReturnSuccess else {
+      return false
     }
     defer {
-      CVPixelBufferUnlockBaseAddress(buffer, .readOnly)
+      CVPixelBufferUnlockBaseAddress(buffer, lockFlags)
     }
-    guard let base = CVPixelBufferGetBaseAddress(buffer) else {
-      return 0
+    let base: UnsafeMutableRawPointer?
+    let width: Int
+    let height: Int
+    let bytesPerRow: Int
+    let bytesPerPixel: Int
+    if let plane = plane {
+      base = CVPixelBufferGetBaseAddressOfPlane(buffer, plane)
+      width = CVPixelBufferGetWidthOfPlane(buffer, plane)
+      height = CVPixelBufferGetHeightOfPlane(buffer, plane)
+      bytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(buffer, plane)
+      // 亮度平面每像素 1 字节，色度平面每像素 2 字节（NV12 的 CbCr 交织）。
+      bytesPerPixel = plane == 0 ? 1 : 2
+    } else {
+      base = CVPixelBufferGetBaseAddress(buffer)
+      width = CVPixelBufferGetWidth(buffer)
+      height = CVPixelBufferGetHeight(buffer)
+      bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
+      bytesPerPixel = 4
     }
-    let height = CVPixelBufferGetHeight(buffer)
-    let width = CVPixelBufferGetWidth(buffer)
-    let bytesPerRow = CVPixelBufferGetBytesPerRow(buffer)
-    guard height > 0, width > 0, bytesPerRow > 0 else {
-      return 0
+    guard let base, width > 0, height > 0, bytesPerRow > 0 else {
+      return false
     }
-    let rowBytes = Swift.min(64, Swift.max(8, width * 4))
     let raw = base.assumingMemoryBound(to: UInt8.self)
-    var hash: UInt64 = 0xcbf2_9ce4_8422_2325
-    for row in 0..<4 {
-      let y = height * (row * 2 + 1) / 8
-      let offset = y * bytesPerRow + (width * 4 - rowBytes) / 2
-      guard offset + rowBytes <= height * bytesPerRow else {
-        continue
-      }
-      for i in 0..<rowBytes {
-        hash ^= UInt64(raw[offset + i])
+    let grid = 8
+    for gy in 0..<grid {
+      // 取每格中心行，避开边缘的编码填充。
+      let y = Swift.min(height - 1, height * (gy * 2 + 1) / (grid * 2))
+      for gx in 0..<grid {
+        let x = Swift.min(width - 1, width * (gx * 2 + 1) / (grid * 2))
+        let offset = y * bytesPerRow + x * bytesPerPixel
+        guard offset >= 0, offset < height * bytesPerRow else { continue }
+        hash ^= UInt64(raw[offset])
         hash = hash &* 0x0000_0100_0000_01b3
       }
     }
-    return hash
+    return true
   }
 
   /// 重置诊断计数（每次真正发起 / 进入画中画时调用）。
@@ -1526,6 +1585,10 @@ public class PictureInPicture: NSObject {
     lastStuckFlush = 0
     lastResumeFlush = 0
     lastPositionFlush = 0
+    // 签名基线跟着清，否则新一轮开局会被上一轮的旧签名判成「同帧」。
+    hasFrameSignature = false
+    lastFrameSignature = 0
+    lastFrameSignatureChangeAt = CACurrentMediaTime()
     // 后台窗口期内（自动进小窗时 `didStart` 会调到这里）清零单次计数，
     // 基线要跟着挪，否则「后台入队」会算成负数。
     if bgSegmentStart > 0 {
