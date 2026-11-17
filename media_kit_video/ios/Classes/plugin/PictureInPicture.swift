@@ -550,6 +550,10 @@ public class PictureInPicture: NSObject {
   private var framePool: CVPixelBufferPool?
   private var framePoolWidth = 0
   private var framePoolHeight = 0
+  /// 池子当前对应的像素格式与平面数。源格式一变就得重建池，
+  /// 否则会拿 BGRA 的池去装 NV12 的帧（泛红的根源之一）。
+  private var framePoolFormat: OSType = 0
+  private var framePoolPlanes = 0
 
   /// 「上一次后台窗口期」的汇总。卡帧只发生在这一段，而读数只能在回前台后取，
   /// 所以必须在这里把起点与基线记下来，否则面板永远是「小窗没在显示」。
@@ -2181,22 +2185,43 @@ public class PictureInPicture: NSObject {
     if width <= 0 || height <= 0 {
       return nil
     }
-    if framePool == nil || framePoolWidth != width || framePoolHeight != height {
+
+    // 源是什么格式，目标就得是什么格式。
+    //
+    // 旧实现无条件建 32BGRA 的单平面池，再拿 `CVPixelBufferGetBaseAddress(source)`
+    // 按行 memcpy。可 mpv 在 6S 上吐的是 NV12（两平面）：`GetBaseAddress` 拿到的是
+    // 亮度平面，每像素 1 字节，而目标每像素 4 字节。于是每行只拷进 width 字节、
+    // 剩下四分之三是池里的脏内存 —— 小窗里就是随机偏红偏绿的条纹，也就是用户说的
+    // 「泛红」。这里按源的平面数和像素格式分别复制，内容才不会被拆散。
+    let planeCount = CVPixelBufferGetPlaneCount(source)
+    let format = CVPixelBufferGetPixelFormatType(source)
+    if framePool == nil
+      || framePoolWidth != width
+      || framePoolHeight != height
+      || framePoolFormat != format
+      || framePoolPlanes != planeCount
+    {
       framePool = nil
       framePoolWidth = width
       framePoolHeight = height
+      framePoolFormat = format
+      framePoolPlanes = planeCount
       // 给池子设一个存活上限：图层卡住时样本会一直攥着缓冲不放，6S 内存小，
       // 宁可退回「直接交轮转缓冲」（可能偶发一帧不干净）也不能把内存吃穿。
       // 限额只能在建池时给：CVPixelBufferPoolCreatePixelBufferWithAuxiliaryAttributes
       // 在 iOS SDK 里没导出，用它会直接编译不过。
-      let attributes: [String: Any] = [
-        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+      var attributes: [String: Any] = [
+        kCVPixelBufferPixelFormatTypeKey as String: format,
         kCVPixelBufferWidthKey as String: width,
         kCVPixelBufferHeightKey as String: height,
         kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
         kCVPixelBufferMetalCompatibilityKey as String: true,
         kCVPixelBufferPoolAllocationThresholdKey as String: 8,
       ]
+      if planeCount > 1 {
+        // 多平面目标池必须显式声明非连续存储，否则拿到的可能是单块内存。
+        attributes[kCVPixelBufferBytesPerRowAlignmentKey as String] = 64
+      }
       var pool: CVPixelBufferPool?
       CVPixelBufferPoolCreate(
         kCFAllocatorDefault,
@@ -2218,19 +2243,33 @@ public class PictureInPicture: NSObject {
     else {
       return nil
     }
+
+    if planeCount > 1 {
+      return copyPlanarFrame(source, dest: dest, planes: planeCount) ? dest : nil
+    }
+    return copyPackedFrame(source, dest: dest) ? dest : nil
+  }
+
+  /// 单平面（BGRA 之类）：按整行拷贝。
+  private func copyPackedFrame(
+    _ source: CVPixelBuffer,
+    dest: CVPixelBuffer
+  ) -> Bool {
     guard CVPixelBufferLockBaseAddress(source, .readOnly) == kCVReturnSuccess
-    else { return nil }
+    else { return false }
     defer { CVPixelBufferUnlockBaseAddress(source, .readOnly) }
     guard CVPixelBufferLockBaseAddress(dest, []) == kCVReturnSuccess else {
-      return nil
+      return false
     }
     defer { CVPixelBufferUnlockBaseAddress(dest, []) }
     guard
       let sourceBase = CVPixelBufferGetBaseAddress(source),
       let destBase = CVPixelBufferGetBaseAddress(dest)
-    else { return nil }
+    else { return false }
+    let height = CVPixelBufferGetHeight(source)
     let sourceStride = CVPixelBufferGetBytesPerRow(source)
     let destStride = CVPixelBufferGetBytesPerRow(dest)
+    // 目标步长可能更小：按两者较小值拷，绝不越过目标行尾。
     let rowBytes = Swift.min(sourceStride, destStride)
     for row in 0..<height {
       memcpy(
@@ -2239,7 +2278,45 @@ public class PictureInPicture: NSObject {
         rowBytes
       )
     }
-    return dest
+    return true
+  }
+
+  /// 多平面（NV12 / 420YpCbCr8BiPlanar）：逐平面、逐行拷贝。
+  ///
+  /// 每个平面都有自己的宽高和步长，必须分别处理；用单平面的行高去拷多平面
+  /// 就是「泛红」的成因。
+  private func copyPlanarFrame(
+    _ source: CVPixelBuffer,
+    dest: CVPixelBuffer,
+    planes: Int
+  ) -> Bool {
+    guard CVPixelBufferLockBaseAddress(source, .readOnly) == kCVReturnSuccess
+    else { return false }
+    defer { CVPixelBufferUnlockBaseAddress(source, .readOnly) }
+    guard CVPixelBufferLockBaseAddress(dest, []) == kCVReturnSuccess else {
+      return false
+    }
+    defer { CVPixelBufferUnlockBaseAddress(dest, []) }
+    let destPlanes = CVPixelBufferGetPlaneCount(dest)
+    guard destPlanes >= planes else { return false }
+    for plane in 0..<planes {
+      guard
+        let sourceBase = CVPixelBufferGetBaseAddressOfPlane(source, plane),
+        let destBase = CVPixelBufferGetBaseAddressOfPlane(dest, plane)
+      else { return false }
+      let planeHeight = CVPixelBufferGetHeightOfPlane(source, plane)
+      let sourceStride = CVPixelBufferGetBytesPerRowOfPlane(source, plane)
+      let destStride = CVPixelBufferGetBytesPerRowOfPlane(dest, plane)
+      let rowBytes = Swift.min(sourceStride, destStride)
+      for row in 0..<planeHeight {
+        memcpy(
+          destBase + row * destStride,
+          sourceBase + row * sourceStride,
+          rowBytes
+        )
+      }
+    }
+    return true
   }
 
   private func emitError(_ message: String) {
