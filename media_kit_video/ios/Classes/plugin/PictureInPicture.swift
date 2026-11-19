@@ -62,6 +62,17 @@ public class PictureInPicture: NSObject {
   /// 「画面源不可见」而拒绝启动画中画。
   private static let hostIdleAlpha: CGFloat = 0.02
 
+  /// 启动阶梯用的提亮值。
+  ///
+  /// 0.02 在 6S 上不够：系统判定画面源「可见」时才置
+  /// `isPictureInPicturePossible = true`，而 6S 的 AVKit 把 0.02×64 点判成
+  /// 不可见，于是启动阶梯把尺寸放大到 64 点也一次没能就绪
+  /// （读数：`hostAlpha 0.02`、`startCalls 3`、`didStart 0`、`showing false`）。
+  /// 提亮到 0.45 后宿主视图仍是屏幕正中的 64 点、肉眼几乎只看到一层极淡的
+  /// 玻璃感，但足以让系统认可它「在显示」。只在启动阶梯内使用，就绪或放弃后
+  /// 立刻退回 [hostIdleAlpha]。
+  private static let hostProbeAlpha: CGFloat = 0.45
+
   /// 画中画控制器（iOS 15+ 才会创建）。
   private var pipController: AVPictureInPictureController?
 
@@ -825,8 +836,12 @@ public class PictureInPicture: NSObject {
   ///
   /// 宿主视图默认只有 2 点见方。AVKit 判定画面源是否可用时，尺寸与可见性是主要
   /// 依据：2 点的图层在 6S 上等不到 `isPictureInPicturePossible == true`，于是切
-  /// 后台那一下根本无窗可开。这里按 24 → 64 点逐档放大（不透明度仍是最低的
-  /// 0.02，屏幕上几乎看不出来），直到系统点头为止。
+  /// 后台那一下根本无窗可开。这里按 24 → 64 点逐档放大，并把不透明度提到
+  /// [hostProbeAlpha]。
+  ///
+  /// 原先这里只放大尺寸、alpha 一直是 0.02。6S 读数显示光放大不够：
+  /// `startCalls 3 / didStart 0 / showing false`，系统始终判画面源不可见。
+  /// 提亮后的 64 点方块是屏幕正中一层极淡的玻璃感，比「画中画永远起不来」划算。
   private func prewarmPossible() {
     guard !isConservativeQaMode || manualStartInFlight else { return }
     DispatchQueue.main.async { [weak self] in
@@ -849,6 +864,7 @@ public class PictureInPicture: NSObject {
       } else if self.hostSide < 64 {
         self.hostSide = 64
       }
+      self.hostView.alpha = PictureInPicture.hostProbeAlpha
       self.attachDisplayLayer()
       self.onNeedFrame?(true)
     }
@@ -908,11 +924,16 @@ public class PictureInPicture: NSObject {
     }
     onNeedFrame?(true)
 
-    // 宿主视图平时只有 2 点见方；个别系统版本对画面源的尺寸判定更严，迟迟不就绪
-    // 时放大一档（对已经就绪的设备没有任何影响）。
+    // 宿主视图平时只有 2 点见方、alpha 0.02；个别系统版本对画面源的尺寸与可见性
+    // 判定更严，迟迟不就绪时同时放大一档并提亮一档（对已经就绪的设备没有任何影响）。
+    //
+    // 这里原来写的是 `hostView.alpha = hostIdleAlpha`，即尺寸放大了、亮度却仍是
+    // 0.02 —— 注释说「提亮」，代码没提。6S 读数正是卡在这：
+    // `hostAlpha 0.02 / startCalls 3 / didStart 0 / showing false / sameFrame 187`，
+    // 尺寸一路放大到 64 点，系统始终判它「不可见」。
     if startTries >= 2, hostSide < 64, allowsForcedFrames {
       hostSide = hostSide < 24 ? 24 : 64
-      hostView.alpha = PictureInPicture.hostIdleAlpha
+      hostView.alpha = PictureInPicture.hostProbeAlpha
       attachDisplayLayer()
     }
 
@@ -928,7 +949,9 @@ public class PictureInPicture: NSObject {
         + "图层 \(layerStatusText())、就绪 \(displayLayer.isReadyForMoreMediaData)、"
         + "已挂入层级 \(hostView.window != nil)、App \(appStateText())）"
     )
+    // 放弃时把提亮状态一并还原：此时屏幕上不该再留任何可见的东西。
     hostSide = lastGoodHostSide
+    hostView.alpha = PictureInPicture.hostIdleAlpha
     attachDisplayLayer()
     // 手动这条路没走通：把「切后台时由系统自己弹窗」重新打开当兜底。
     // 两条路都留着，总比屏幕上什么都没有强。
